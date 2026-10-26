@@ -1,0 +1,4 @@
+.godot/
+build/
+*.keystore
+export_credentials.cfg

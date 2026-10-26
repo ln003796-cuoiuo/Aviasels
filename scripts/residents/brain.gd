@@ -1,0 +1,294 @@
+extends RefCounted
+## Принятие решений жителя: потребности -> оценка целей (utility) -> план действий.
+## Работает только с общим состоянием мира, без случайного выбора анимаций.
+
+const Defs = preload("res://scripts/core/object_defs.gd")
+
+const PERCEPTION := 11.0
+
+# Изменение потребностей за игровой час
+const FOOD_PER_H := 4.5
+const WATER_PER_H := 7.0
+const ENERGY_PER_H := 4.5
+const SOCIAL_PER_H := 3.5
+
+static func update_needs(r, hours: float) -> void:
+	var m = r.mind
+	var w = r.world
+	var near_fire := false
+	var near_campfire := false
+	for o in w.objects_near(r.sim_pos, 4.0):
+		if o.is_dangerous() and o.position.distance_to(r.sim_pos) < 2.6:
+			near_fire = true
+		if o.obj_type == "campfire":
+			near_campfire = true
+	var sleep_mul: float = 0.55 if m.sleeping else 1.0
+	m.food = clampf(m.food - FOOD_PER_H * hours * sleep_mul, 0.0, 100.0)
+	m.water = clampf(m.water - WATER_PER_H * hours * sleep_mul, 0.0, 100.0)
+	if m.sleeping:
+		var in_hut: bool = r.current_step().get("obj", -1) >= 0
+		m.energy = clampf(m.energy + (22.0 if in_hut else 13.0) * hours, 0.0, 100.0)
+	else:
+		var walk_extra: float = 2.0 if r.is_moving else 0.0
+		m.energy = clampf(m.energy - (ENERGY_PER_H + walk_extra) * hours, 0.0, 100.0)
+	if r.talk_partner_id < 0:
+		m.social = clampf(m.social - SOCIAL_PER_H * hours * (0.5 + m.traits["sociability"]), 0.0, 100.0)
+	# здоровье
+	var dmg := 0.0
+	if m.food <= 0.0: dmg += 6.0
+	if m.water <= 0.0: dmg += 9.0
+	if m.energy <= 0.0: dmg += 2.0
+	if near_fire: dmg += 40.0
+	if dmg > 0.0:
+		m.health = clampf(m.health - dmg * hours, 0.0, 100.0)
+	elif m.food > 30.0 and m.water > 30.0 and m.energy > 20.0:
+		m.health = clampf(m.health + 2.5 * hours, 0.0, 100.0)
+	# настроение тянется к общему благополучию
+	var target: float = m.food * 0.22 + m.water * 0.22 + m.energy * 0.18 + m.social * 0.18 + m.health * 0.2
+	if near_campfire: target += 12.0
+	if near_fire: target -= 40.0
+	if m.is_in_danger_zone(r.sim_pos, w.time_min): target -= 15.0
+	target += (m.traits["calm"] - 0.5) * 10.0
+	m.mood = clampf(lerpf(m.mood, target, clampf(0.15 * hours, 0.0, 1.0)), 0.0, 100.0)
+
+## Восприятие: обновить знания о ближайших объектах и людях, заметить исчезнувшее.
+static func perceive(r) -> void:
+	var m = r.mind
+	var w = r.world
+	var radius: float = PERCEPTION + m.traits["curiosity"] * 4.0
+	if w.is_night():
+		radius *= 0.6
+	var seen := {}
+	for o in w.objects_near(r.sim_pos, radius):
+		seen[str(o.obj_id)] = true
+		if o.is_dangerous():
+			var until: float = w.time_min + 60.0 * (6.0 + 6.0 * m.traits["caution"])
+			if not m.is_in_danger_zone(o.position, w.time_min):
+				m.remember(w.time_min, "danger", r.g("Увидел", "Увидела") + " огонь — опасное место", 0.8)
+				w.log_event("%s замечает пожар и запоминает опасное место" % m.name)
+			m.add_danger(o.position, 5.0 + 3.0 * m.traits["caution"], until)
+		if o.obj_type in ["bush", "spring", "hut", "campfire"]:
+			var is_new: bool = m.know_place(o.obj_id, o.obj_type, o.position, o.amount, w.time_min)
+			if is_new:
+				m.add_skill("исследование", 1.5)
+				if o.obj_type != "bush" or m.places_of("bush").size() <= 3:
+					m.remember(w.time_min, "discover", r.g("Нашёл", "Нашла") + ": " + Defs.display_name(o.obj_type).to_lower(), 0.45 if o.obj_type == "bush" else 0.6)
+				if o.obj_type in ["spring", "hut"]:
+					w.log_event("%s находит %s" % [m.name, "родник" if o.obj_type == "spring" else "хижину"])
+	# известные места в поле зрения, которых больше нет
+	for key in m.known_places.keys():
+		var p: Dictionary = m.known_places[key]
+		var pos := Vector3(p["x"], 0, p["z"])
+		var flat := Vector2(r.sim_pos.x - pos.x, r.sim_pos.z - pos.z).length()
+		if flat < radius * 0.8 and not seen.has(key):
+			m.forget_place(int(key))
+			var what: String = Defs.display_name(p["type"]).to_lower()
+			m.remember(w.time_min, "loss", "Знакомое место исчезло: " + what, 0.8 if p["type"] == "spring" else 0.55)
+			m.mood = maxf(0.0, m.mood - (12.0 if p["type"] == "spring" else 5.0))
+			w.log_event("%s обнаруживает, что пропало знакомое место: %s" % [m.name, what])
+	# другие жители
+	for other in w.residents:
+		if other == r or not other.mind.alive:
+			continue
+		if other.sim_pos.distance_to(r.sim_pos) < radius:
+			var rel: Dictionary = m.rel(other.mind.id, other.mind.name)
+			if float(rel["familiarity"]) <= 0.0:
+				rel["familiarity"] = 1.0
+				rel["last"] = w.time_min
+				m.remember(w.time_min, "meet", r.g("Впервые встретил ", "Впервые встретила ") + other.mind.name, 0.9)
+
+# ---------------------------------------------------------------- выбор цели
+
+## Возвращает массив кандидатов {goal, u, reason}.
+static func evaluate(r) -> Array:
+	var m = r.mind
+	var w = r.world
+	var out: Array = []
+	# 1. опасность рядом — бежать
+	var danger = w.nearest_danger(r.sim_pos, 6.0 + 4.0 * m.traits["caution"])
+	if danger != null:
+		out.append({"goal": "flee", "u": 10.0, "reason": "Рядом огонь — нужно уйти в безопасное место"})
+	var water_need: float = (100.0 - m.water) / 100.0
+	var food_need: float = (100.0 - m.food) / 100.0
+	var energy_need: float = (100.0 - m.energy) / 100.0
+	out.append({"goal": "drink", "u": water_need * water_need * 1.6 + (0.6 if m.water < 25.0 else 0.0),
+		"reason": "Хочется пить (вода %d%%)" % int(m.water)})
+	out.append({"goal": "eat", "u": food_need * food_need * 1.5 + (0.5 if m.food < 25.0 else 0.0),
+		"reason": "Голод (сытость %d%%)" % int(m.food)})
+	var night_bonus := 0.0
+	if w.is_night() and m.energy < 85.0:
+		night_bonus = 0.55
+	out.append({"goal": "sleep", "u": energy_need * energy_need * 1.4 + night_bonus + (0.6 if m.energy < 15.0 else 0.0),
+		"reason": ("Ночь, пора спать" if night_bonus > 0.0 else "Усталость") + " (энергия %d%%)" % int(m.energy)})
+	var partner = _best_partner(r) if w.time_min >= r.talk_cooldown_until else null
+	if partner != null:
+		var soc: float = (100.0 - m.social) / 100.0 * (0.35 + 0.8 * m.traits["sociability"])
+		var rel: Dictionary = m.rel(partner.mind.id, partner.mind.name)
+		soc += clampf(float(rel["affinity"]) / 200.0, -0.2, 0.25)
+		if w.is_night(): soc *= 0.3
+		out.append({"goal": "socialize", "u": soc, "reason": "Хочется пообщаться с %s" % partner.mind.name, "target": partner.mind.id})
+	if m.mood < 55.0 and not m.places_of("campfire").is_empty():
+		out.append({"goal": "rest", "u": (55.0 - m.mood) / 55.0 * 0.8 + 0.1, "reason": "Плохое настроение — отдохнуть у костра"})
+	var explore: float = 0.12 + m.traits["curiosity"] * 0.3
+	if m.places_of("spring").is_empty() or m.places_of("bush").is_empty():
+		explore += 0.25
+	if w.is_night(): explore *= 0.3
+	out.append({"goal": "explore", "u": explore, "reason": "Любопытно, что вокруг" if m.traits["curiosity"] > 0.5 else "Нужно лучше знать окрестности"})
+	return out
+
+static func _best_partner(r):
+	var best = null
+	var best_score := -INF
+	for o in r.world.residents:
+		if o == r or not o.mind.alive or o.mind.sleeping or o.mind.goal == "flee":
+			continue
+		if o.talk_partner_id >= 0 and o.talk_partner_id != r.mind.id:
+			continue
+		var rel: Dictionary = r.mind.rel(o.mind.id, o.mind.name)
+		if float(rel["affinity"]) < -60.0:
+			continue
+		var score: float = float(rel["affinity"]) - o.sim_pos.distance_to(r.sim_pos)
+		if score > best_score:
+			best_score = score
+			best = o
+	return best
+
+static func decide(r) -> void:
+	var m = r.mind
+	var cands := evaluate(r)
+	cands.sort_custom(func(a, b): return a["u"] > b["u"])
+	for c in cands:
+		var plan := build_plan(r, c)
+		if not plan.is_empty():
+			if m.goal != c["goal"]:
+				r.world.trace("%s: цель «%s» (%s)" % [m.name, goal_name(c["goal"]), c["reason"]])
+			m.goal = c["goal"]
+			m.goal_reason = c["reason"]
+			r.set_plan(plan, float(c["u"]))
+			return
+	m.goal = "idle"
+	m.goal_reason = "Не видит, чем заняться"
+	r.set_plan([{"a": "look", "dur": 20.0}], 0.0)
+
+static func goal_name(g: String) -> String:
+	return {"flee": "спастись от огня", "drink": "попить", "eat": "поесть", "sleep": "поспать",
+		"socialize": "пообщаться", "rest": "отдохнуть у костра", "explore": "исследовать",
+		"idle": "осмотреться", "talk": "разговор"}.get(g, g)
+
+## Построить план для цели. Пустой план — цель сейчас недостижима.
+static func build_plan(r, c: Dictionary) -> Array:
+	var m = r.mind
+	var w = r.world
+	match c["goal"]:
+		"flee":
+			var d = w.nearest_danger(r.sim_pos, 20.0)
+			if d == null:
+				return []
+			var away: Vector3 = (r.sim_pos - d.position)
+			away.y = 0
+			if away.length() < 0.1:
+				away = Vector3(1, 0, 0)
+			var target: Vector3 = r.sim_pos + away.normalized() * 12.0
+			return [{"a": "go", "x": target.x, "z": target.z, "run": true, "near": 2.0}]
+		"drink":
+			return _plan_resource(r, "spring", "drink", 10.0)
+		"eat":
+			return _plan_resource(r, "bush", "eat", 15.0)
+		"sleep":
+			var huts: Array = _sorted_places(r, "hut")
+			if not huts.is_empty():
+				var h: Dictionary = huts[0]
+				return [{"a": "go", "x": h["x"], "z": h["z"], "obj": h["id"], "near": 2.2}, {"a": "sleep", "obj": h["id"]}]
+			return [{"a": "sleep", "obj": -1}]
+		"socialize":
+			return [{"a": "go", "rid": c.get("target", -1), "near": 1.8}, {"a": "talk_request", "rid": c.get("target", -1)}]
+		"rest":
+			var fires: Array = _sorted_places(r, "campfire")
+			if fires.is_empty():
+				return []
+			var f: Dictionary = fires[0]
+			return [{"a": "go", "x": f["x"], "z": f["z"], "obj": f["id"], "near": 1.6}, {"a": "rest", "obj": f["id"], "dur": 60.0}]
+		"explore":
+			var t = _explore_target(r)
+			if t == null:
+				return []
+			return [{"a": "go", "x": t.x, "z": t.z, "near": 1.5, "explore": true}, {"a": "look", "dur": 10.0}]
+	return []
+
+static func _sorted_places(r, t: String) -> Array:
+	var m = r.mind
+	var arr: Array = m.places_of(t)
+	arr = arr.filter(func(p): return not m.is_in_danger_zone(Vector3(p["x"], 0, p["z"]), r.world.time_min) and not r.unreachable.has(int(p["id"])))
+	if t == "bush":
+		arr = arr.filter(func(p): return float(p["amount"]) >= 1.0 or r.world.time_min - float(p["seen"]) > 6.0 * 60.0)
+	var pos: Vector3 = r.sim_pos
+	arr.sort_custom(func(a, b): return Vector2(a["x"] - pos.x, a["z"] - pos.z).length() < Vector2(b["x"] - pos.x, b["z"] - pos.z).length())
+	return arr
+
+static func _plan_resource(r, t: String, act: String, dur: float) -> Array:
+	var places := _sorted_places(r, t)
+	if places.is_empty():
+		# не знает источника — идти искать
+		var target = _explore_target(r)
+		if target == null:
+			return []
+		r.mind.action_text = "Ищет " + ("воду" if t == "spring" else "еду")
+		return [{"a": "go", "x": target.x, "z": target.z, "near": 1.5, "explore": true, "seek": t}]
+	var p: Dictionary = places[0]
+	return [{"a": "go", "x": p["x"], "z": p["z"], "obj": p["id"], "near": 1.6 if t == "bush" else 1.9}, {"a": act, "obj": p["id"], "dur": dur}]
+
+static func _explore_target(r):
+	var w = r.world
+	var m = r.mind
+	var rng: RandomNumberGenerator = r.rng
+	var best = null
+	var best_score := -INF
+	var max_dist: float = 10.0 + m.traits["curiosity"] * 14.0 - m.traits["caution"] * 4.0
+	for i in 10:
+		var a := rng.randf() * TAU
+		var dist := rng.randf_range(5.0, max_dist)
+		var p: Vector3 = r.sim_pos + Vector3(cos(a), 0, sin(a)) * dist
+		if absf(p.x) > 46.0 or absf(p.z) > 46.0:
+			continue
+		if not w.nav.is_walkable(p) or m.is_in_danger_zone(p, w.time_min):
+			continue
+		# предпочитаем места дальше от уже известных объектов
+		var novelty := 0.0
+		for k in m.known_places:
+			var kp: Dictionary = m.known_places[k]
+			novelty += minf(20.0, Vector2(kp["x"] - p.x, kp["z"] - p.z).length())
+		novelty /= maxf(1.0, m.known_places.size())
+		var score := novelty + rng.randf() * 6.0
+		if score > best_score:
+			best_score = score
+			best = p
+	return best
+
+# ---------------------------------------------------------------- диалоги
+
+static func dialogue(r, other, topic: String, extra: String = "") -> String:
+	var m = r.mind
+	match topic:
+		"ask":
+			return ["Поговорим?", "Можно с тобой поговорить, %s?" % other.mind.name][r.rng.randi() % 2]
+		"greet":
+			return ["Привет! Я %s." % m.name, "Здравствуй, меня зовут %s." % m.name][r.rng.randi() % 2]
+		"share":
+			return "Я знаю, где %s. Пойдём покажу!" % extra
+		"hungry":
+			return r.g("Я так проголодался...", "Я так проголодалась...")
+		"thirsty":
+			return "Очень хочется пить."
+		"tired":
+			return "Я совсем без сил."
+		"fire":
+			return "Там огонь! Будь осторожн%s." % ("ой" if other.mind.sex == "f" else "ым")
+		"happy":
+			return ["Хороший сегодня день.", "Как здесь красиво!", "Рад%s тебя видеть, %s." % ["а" if m.sex == "f" else "", other.mind.name]][r.rng.randi() % 3]
+		"quarrel":
+			return ["Оставь меня в покое!", "Ты опять за своё?", "Не хочу сейчас говорить."][r.rng.randi() % 3]
+		"refuse":
+			return "Не сейчас, мне нужно %s." % extra
+		"loss":
+			return "Ты знаешь, пропало место: %s..." % extra
+	return "..."

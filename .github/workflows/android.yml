@@ -1,0 +1,134 @@
+name: Эволюция — тесты и Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_RELEASE: "stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Godot and export templates
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_VERSION }}-${{ env.GODOT_RELEASE }}-android-v1
+
+      - name: Download Godot and Android templates
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          V="${GODOT_VERSION}-${GODOT_RELEASE}"
+          BASE="https://github.com/godotengine/godot/releases/download/${V}"
+          mkdir -p ~/godot
+          curl -fsSL -o /tmp/godot.zip "${BASE}/Godot_v${V}_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d ~/godot
+          mv ~/godot/Godot_v${V}_linux.x86_64 ~/godot/godot
+          curl -fsSL -o /tmp/templates.tpz "${BASE}/Godot_v${V}_export_templates.tpz"
+          TDIR=~/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}
+          mkdir -p "$TDIR"
+          unzip -q -j /tmp/templates.tpz "templates/android_*" "templates/version.txt" -d "$TDIR"
+          ls -la "$TDIR"
+
+      - name: Import project
+        run: |
+          chmod +x ~/godot/godot
+          ~/godot/godot --version
+          ~/godot/godot --headless --editor --quit 2>&1 | tee import.log || true
+          if grep -q "SCRIPT ERROR\|Parse Error" import.log; then echo "::error::Ошибки в скриптах"; exit 1; fi
+
+      - name: Simulation tests
+        run: |
+          set -o pipefail
+          ~/godot/godot --headless --script res://tests/run_tests.gd 2>&1 | grep -v "mesh_get_surface_count\|Parameter \"m\" is null" | tee tests.log
+          if grep -q "SCRIPT ERROR" tests.log; then echo "::error::Ошибки скриптов во время тестов"; exit 1; fi
+
+      - name: Smoke run of the game scene
+        run: |
+          ~/godot/godot --headless --quit-after 900 2>&1 | grep -v "mesh_get_surface_count\|Parameter \"m\" is null" | tee smoke.log || true
+          if grep -q "SCRIPT ERROR" smoke.log; then echo "::error::Ошибки при запуске игры"; exit 1; fi
+
+      - name: Configure Android export
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "SDK=$SDK"; ls "$SDK/build-tools"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "build-tools;34.0.0" "platforms;android-34" "platform-tools" >/dev/null
+          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -storepass android -keypass android \
+            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000
+          mkdir -p ~/.config/godot
+          cat > ~/.config/godot/editor_settings-${GODOT_VERSION}.tres <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$SDK"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          EOF
+          sed -i 's/^ *//' ~/.config/godot/editor_settings-${GODOT_VERSION}.tres
+          cat ~/.config/godot/editor_settings-${GODOT_VERSION}.tres
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$HOME/debug.keystore" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> $GITHUB_ENV
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> $GITHUB_ENV
+
+      - name: Export APK
+        run: |
+          set -o pipefail
+          mkdir -p build
+          sed -i "s/^version\/code=.*/version\/code=${GITHUB_RUN_NUMBER}/" export_presets.cfg
+          ~/godot/godot --headless --export-debug "Android" build/Evolution.apk 2>&1 | tee export.log
+          test -s build/Evolution.apk || { echo "::error::APK не создан"; exit 1; }
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          BT="$(ls -d "$SDK"/build-tools/* | sort -V | tail -n 1)"
+          ls -la build/Evolution.apk
+          "$BT/apksigner" verify --print-certs build/Evolution.apk
+          "$BT/aapt" dump badging build/Evolution.apk | head -n 5
+          unzip -l build/Evolution.apk | grep -E "lib/.*libgodot_android.so|assets/.*pck|classes.dex"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Evolution-debug-apk
+          path: build/Evolution.apk
+          if-no-files-found: error
+
+      - name: Publish APK to release "evolution-latest"
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete evolution-latest --yes --cleanup-tag || true
+          gh release create evolution-latest build/Evolution.apk \
+            --title "Эволюция — последняя сборка (#${GITHUB_RUN_NUMBER})" \
+            --notes "Автоматическая debug-сборка из коммита ${GITHUB_SHA}. Тесты симуляции пройдены. Проверка на реальном устройстве — вручную." \
+            --prerelease --target "${GITHUB_SHA}"
