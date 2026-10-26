@@ -69,10 +69,16 @@ func _run() -> void:
 	check(not a.mind.places_of("spring").is_empty(), "житель запомнил, где родник")
 
 	print("[3 игровых дня без вмешательства]")
-	var start_pos: Vector3 = a.sim_pos
-	_sim(w, 3 * 24 * 60)
+	var walked := 0.0
+	var prev_a: Vector3 = a.sim_pos
+	var prev_b: Vector3 = b.sim_pos
+	for i in 3 * 24 * 60:
+		w.step(1.0)
+		walked += a.sim_pos.distance_to(prev_a) + b.sim_pos.distance_to(prev_b)
+		prev_a = a.sim_pos
+		prev_b = b.sim_pos
 	check(a.mind.alive and b.mind.alive, "оба жителя живы через 3 дня")
-	check(a.sim_pos.distance_to(start_pos) > 1.0 or b.sim_pos.distance_to(start_pos) > 1.0, "жители перемещались")
+	check(walked > 30.0, "жители перемещались (путь %.0f)" % walked)
 	check(float(a.mind.skills["собирательство"]) > 0.0 and float(b.mind.skills["собирательство"]) > 0.0, "оба ели ягоды")
 	check(a.mind.memory.size() >= 3 and b.mind.memory.size() >= 3, "у жителей есть воспоминания (%d / %d)" % [a.mind.memory.size(), b.mind.memory.size()])
 	var rel: Dictionary = a.mind.rel(b.mind.id)
