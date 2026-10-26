@@ -3,6 +3,11 @@ extends RefCounted
 ## Чистые данные + сериализация; решения принимает brain.gd.
 
 const MAX_MEMORY := 80
+## Один игровой год = 2 игровых дня (сжатие времени, чтобы поколения сменялись за разумное время).
+const YEAR_MIN := 2880.0
+const DEPENDENT_AGE := 6.0     # до этого возраста ребёнок не добывает еду сам
+const ADULT_AGE := 16.0
+const ELDER_AGE := 55.0
 
 var id: int = 0
 var name: String = ""
@@ -20,16 +25,37 @@ var health: float = 100.0
 var mood: float = 70.0
 
 # Черты характера 0..1
-var traits := {"curiosity": 0.5, "caution": 0.5, "sociability": 0.5, "calm": 0.5}
+var traits := {"curiosity": 0.5, "caution": 0.5, "sociability": 0.5, "calm": 0.5, "vitality": 0.5}
 var preferences := {}            # например {"favorite_place": "spring"}
 var long_goal: String = ""
 
-var skills := {"собирательство": 0.0, "общение": 0.0, "исследование": 0.0, "выживание": 0.0}
+var skills := {"собирательство": 0.0, "общение": 0.0, "исследование": 0.0, "выживание": 0.0, "забота": 0.0}
 
 var memory: Array = []           # [{t, kind, text, imp}]
 var known_places := {}           # obj_id(str) -> {type, x, z, amount, seen}
 var danger_zones: Array = []     # [{x, z, r, until}]
 var relationships := {}          # other_id(str) -> {name, affinity, familiarity, talks, last}
+
+# Семья и поколения
+var mother_id: int = -1
+var father_id: int = -1
+var partner_id: int = -1
+var children: Array = []          # id детей
+var generation: int = 1
+var family_name: String = ""      # род (по первому предку)
+var born_at: float = 0.0          # игровое время рождения (может быть отрицательным для первых людей)
+var lifespan: float = 70.0        # предел жизни в годах (наследуется через «живучесть»)
+var pregnant: bool = false
+var pregnancy_due: float = 0.0
+var pregnancy_father: int = -1
+var last_birth: float = -1.0e9
+var carry := {"food": 0, "water": 0}  # что несёт для ребёнка
+var sick_until: float = 0.0
+var illness: String = ""
+var traditions: Array = []        # культурные привычки рода
+var habit := {"hut_nights": 0, "fire_evenings": 0, "shared": 0}
+var cause_of_death: String = ""
+var died_at: float = -1.0
 
 # Текущее решение
 var goal: String = "idle"
@@ -103,8 +129,34 @@ func cleanup(now: float) -> void:
 func rel(other_id: int, other_name: String = "") -> Dictionary:
 	var key := str(other_id)
 	if not relationships.has(key):
-		relationships[key] = {"name": other_name, "affinity": 0.0, "familiarity": 0.0, "talks": 0, "last": -1.0}
-	return relationships[key]
+		relationships[key] = {"name": other_name, "affinity": 0.0, "familiarity": 0.0, "talks": 0, "last": -1.0, "romance": 0.0}
+	var r: Dictionary = relationships[key]
+	if not r.has("romance"):
+		r["romance"] = 0.0
+	return r
+
+# ---------------------------------------------------------------- возраст
+
+func stage() -> String:
+	if age_years < 3.0: return "baby"
+	if age_years < 12.0: return "child"
+	if age_years < ADULT_AGE: return "teen"
+	if age_years < ELDER_AGE: return "adult"
+	return "elder"
+
+func stage_name() -> String:
+	var f := sex == "f"
+	return {"baby": "младенец", "child": "девочка" if f else "мальчик", "teen": "девушка" if f else "юноша",
+		"adult": "женщина" if f else "мужчина", "elder": "старушка" if f else "старик"}[stage()]
+
+func is_adult() -> bool:
+	return age_years >= ADULT_AGE
+
+func is_dependent() -> bool:
+	return age_years < DEPENDENT_AGE
+
+func is_sick(now: float) -> bool:
+	return sick_until > now
 
 static func relation_label(affinity: float, familiarity: float) -> String:
 	if familiarity < 5.0:
@@ -132,6 +184,8 @@ func trait_text() -> String:
 	if traits["sociability"] < 0.35: parts.append("замкнутый" if sex == "m" else "замкнутая")
 	if traits["calm"] > 0.65: parts.append("спокойный" if sex == "m" else "спокойная")
 	if traits["calm"] < 0.35: parts.append("вспыльчивый" if sex == "m" else "вспыльчивая")
+	if float(traits.get("vitality", 0.5)) > 0.7: parts.append("крепкий" if sex == "m" else "крепкая")
+	if float(traits.get("vitality", 0.5)) < 0.3: parts.append("хрупкий" if sex == "m" else "хрупкая")
 	if parts.is_empty():
 		parts.append("уравновешенный" if sex == "m" else "уравновешенная")
 	return ", ".join(parts)
@@ -140,7 +194,10 @@ func trait_text() -> String:
 
 const FIELDS := ["id", "name", "sex", "age_years", "alive", "appearance", "food", "water", "energy",
 	"social", "health", "mood", "traits", "preferences", "long_goal", "skills", "memory",
-	"known_places", "danger_zones", "relationships", "goal", "goal_reason", "action_text", "sleeping"]
+	"known_places", "danger_zones", "relationships", "goal", "goal_reason", "action_text", "sleeping",
+	"mother_id", "father_id", "partner_id", "children", "generation", "family_name", "born_at", "lifespan",
+	"pregnant", "pregnancy_due", "pregnancy_father", "last_birth", "carry", "sick_until", "illness",
+	"traditions", "habit", "cause_of_death", "died_at"]
 
 func to_dict() -> Dictionary:
 	var d := {}
@@ -162,3 +219,10 @@ func from_dict(d: Dictionary) -> void:
 				v = bool(v)
 			set(f, v)
 	plan = []
+	if not traits.has("vitality"):
+		traits["vitality"] = 0.5
+	var ints: Array = []
+	for c in children:
+		ints.append(int(c))
+	children = ints
+	carry = {"food": int(carry.get("food", 0)), "water": int(carry.get("water", 0))}

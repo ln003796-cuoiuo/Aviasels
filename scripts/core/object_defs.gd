@@ -9,6 +9,7 @@ const DEFS := {
 	"hut": {"name": "Хижина", "blocks": true, "shelter": true, "max": 0},
 	"campfire": {"name": "Костёр", "blocks": false, "warmth": true, "max": 0},
 	"fire": {"name": "Пожар", "blocks": true, "danger": true, "max": 0, "life_h": 10.0},
+	"grave": {"name": "Могила", "blocks": false, "max": 0},
 }
 
 ## Инструменты, доступные создателю (порядок = порядок кнопок).

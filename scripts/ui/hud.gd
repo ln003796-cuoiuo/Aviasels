@@ -5,6 +5,7 @@ const Defs = preload("res://scripts/core/object_defs.gd")
 const Mind = preload("res://scripts/residents/mind.gd")
 const Brain = preload("res://scripts/residents/brain.gd")
 const SaveSystem = preload("res://scripts/core/save_system.gd")
+const Family = preload("res://scripts/residents/family.gd")
 
 var main      # main.gd
 var world
@@ -31,6 +32,7 @@ var _side: PanelContainer
 var _side_title: Label
 var _side_text: RichTextLabel
 var _side_mode := ""
+var _chart: Control
 
 var _menu: PanelContainer
 var _slot_labels := {}
@@ -102,7 +104,7 @@ func _build() -> void:
 	_time_label.custom_minimum_size = Vector2(190, 0)
 	_time_label.add_theme_font_size_override("font_size", 22)
 	th.add_child(_time_label)
-	for sp in [[0, "II"], [1, "x1"], [3, "x3"], [10, "x10"]]:
+	for sp in [[0, "II"], [1, "x1"], [3, "x3"], [10, "x10"], [30, "x30"]]:
 		var b := _button(sp[1], func(): main.set_speed(sp[0]), Vector2(62, 52))
 		b.toggle_mode = true
 		th.add_child(b)
@@ -123,6 +125,7 @@ func _build() -> void:
 	trh.add_theme_constant_override("separation", 6)
 	tr.add_child(trh)
 	trh.add_child(_button("Жители", func(): _toggle_side("people")))
+	trh.add_child(_button("Семьи", func(): _toggle_side("family")))
 	trh.add_child(_button("Журнал", func(): _toggle_side("log")))
 	trh.add_child(_button("Мир", func(): _toggle_side("world")))
 	trh.add_child(_button("Меню", func(): show_menu(not _menu.visible)))
@@ -259,6 +262,11 @@ func _build() -> void:
 	_side_text.add_theme_font_size_override("normal_font_size", 17)
 	_side_text.add_theme_font_override("bold_font", load("res://fonts/NotoSans-Bold.ttf"))
 	_side_text.meta_clicked.connect(_on_meta)
+	_chart = Control.new()
+	_chart.custom_minimum_size = Vector2(0, 150)
+	_chart.visible = false
+	_chart.draw.connect(_draw_chart)
+	sv.add_child(_chart)
 	sv.add_child(_side_text)
 
 	# --- меню
@@ -430,6 +438,10 @@ func _on_meta(meta) -> void:
 	if r:
 		main.select(r)
 		main.camera.focus_on(r.sim_pos, 14.0)
+	else:
+		var m = world.mind_by_id(int(str(meta)))
+		if m != null:
+			toast("%s — %s %s в %d лет" % [m.name, "умер" if m.sex == "m" else "умерла", m.cause_of_death, int(m.age_years)])
 
 # ---------------------------------------------------------------- обновление
 
@@ -442,7 +454,7 @@ func _process(delta: float) -> void:
 		return
 	_refresh_t = 0.35
 	_time_label.text = world.time_string() + ("  ночь" if world.is_night() else "")
-	_stats_label.text = "Жителей: %d · деревьев: %d · кустов: %d · родников: %d" % [world.alive_count(), world.count_type("tree"), world.count_type("bush"), world.count_type("spring")]
+	_stats_label.text = "Жителей: %d · рождений: %d · смертей: %d · кустов: %d · родников: %d" % [world.alive_count(), int(world.stats["births"]), int(world.stats["deaths"]), world.count_type("bush"), world.count_type("spring")] + ("\nТелефон не успевает — симуляция идёт медленнее выбранной скорости" if world.lagging and world.speed > 1 else "")
 	if _card.visible:
 		_refresh_card()
 	if _obj_panel.visible:
@@ -461,11 +473,13 @@ func _bar_color(v: float) -> Color:
 
 func _refresh_card() -> void:
 	var r = main.selected
-	if r == null or not is_instance_valid(r) or not r.has_method("sim_step"):
+	if r == null or not is_instance_valid(r) or not r.has_method("sim_step") or r.is_queued_for_deletion():
+		if _card.visible:
+			main.select(null)
 		return
 	var m = r.mind
 	_card_title.text = m.name + ("" if m.alive else " †")
-	_card_info.text = "%s, %d лет · %s\nЦель жизни: %s" % ["Мужчина" if m.sex == "m" else "Женщина", int(m.age_years), m.trait_text(), m.long_goal]
+	_card_info.text = "%s, %d %s · поколение %d · род %s\n%s\nЦель жизни: %s" % [m.stage_name().capitalize(), int(m.age_years), _years_word(int(m.age_years)), m.generation, m.family_name if m.family_name != "" else "—", m.trait_text(), m.long_goal]
 	for k in _card_bars:
 		var pb: ProgressBar = _card_bars[k]
 		var v: float = m.get(k)
@@ -483,8 +497,9 @@ func _refresh_card() -> void:
 	if m.plan.size() > 0:
 		var steps: Array = []
 		for s in m.plan:
-			steps.append({"go": "идти", "eat": "есть", "drink": "пить", "sleep": "спать", "talk": "говорить", "talk_request": "заговорить", "rest": "греться", "look": "осмотреться"}.get(s["a"], s["a"]))
+			steps.append({"go": "идти", "eat": "есть", "drink": "пить", "sleep": "спать", "talk": "говорить", "talk_request": "заговорить", "rest": "греться", "look": "осмотреться", "gather": "собрать", "feed": "накормить"}.get(s["a"], s["a"]))
 		t += "[b]План:[/b] " + " → ".join(steps) + "\n"
+	t += _family_block(m)
 	t += "\n[b]Отношения[/b]\n"
 	if m.relationships.is_empty():
 		t += "Пока ни с кем не знаком%s\n" % ("" if m.sex == "m" else "а")
@@ -513,6 +528,110 @@ func _refresh_card() -> void:
 			t += "[color=#9fb3c8]%s[/color]  %s\n" % [world.time_string(mem["t"]), mem["text"]]
 	_card_text.text = t
 
+func _years_word(n: int) -> String:
+	var n10 := n % 10
+	var n100 := n % 100
+	if n10 == 1 and n100 != 11: return "год"
+	if n10 >= 2 and n10 <= 4 and (n100 < 12 or n100 > 14): return "года"
+	return "лет"
+
+func _person_link(id: int) -> String:
+	var o = world.mind_by_id(id)
+	if o == null:
+		return "?"
+	return "[url=%d]%s[/url]%s" % [id, o.name, "" if o.alive else " †"]
+
+func _family_block(m) -> String:
+	var t := "\n[b]Семья[/b]\n"
+	var parents: Array = []
+	for pid in [m.mother_id, m.father_id]:
+		if pid >= 0:
+			parents.append(_person_link(pid))
+	t += "Родители: %s\n" % (", ".join(parents) if not parents.is_empty() else "нет — первые люди мира")
+	if m.partner_id >= 0:
+		t += "%s: %s\n" % ["Муж" if m.sex == "f" else "Жена", _person_link(m.partner_id)]
+	elif m.is_adult():
+		t += "Пары нет\n"
+	if not m.children.is_empty():
+		t += "Дети: %s\n" % ", ".join(m.children.map(func(c): return _person_link(int(c))))
+	var sibs: Array = []
+	for o in world.all_minds():
+		if o.id != m.id and ((m.mother_id >= 0 and o.mother_id == m.mother_id) or (m.father_id >= 0 and o.father_id == m.father_id)):
+			sibs.append(_person_link(o.id))
+	if not sibs.is_empty():
+		t += "Братья и сёстры: %s\n" % ", ".join(sibs)
+	if m.pregnant:
+		t += "[color=#ffd27a]Ждёт ребёнка, роды примерно через %d ч[/color]\n" % int(maxf(0.0, m.pregnancy_due - world.time_min) / 60.0)
+	if m.is_sick(world.time_min):
+		t += "[color=#ff9a8a]Болеет: %s (ещё ~%d ч)[/color]\n" % [m.illness, int((m.sick_until - world.time_min) / 60.0)]
+	if int(m.carry.get("food", 0)) > 0 or int(m.carry.get("water", 0)) > 0:
+		t += "Несёт ребёнку: %s\n" % ("ягоды" if int(m.carry.get("food", 0)) > 0 else "воду")
+	if m.is_dependent():
+		t += "[color=#9fb3c8]Ещё мал%s: сам%s не добывает еду, о %s заботятся взрослые[/color]\n" % ["" if m.sex == "m" else "а", "" if m.sex == "m" else "а", "нём" if m.sex == "m" else "ней"]
+	if not m.traditions.is_empty():
+		t += "Традиции: %s\n" % ", ".join(m.traditions.map(func(x): return Family.TRADITIONS[x]["name"].to_lower()))
+	return t
+
+## Родословная: дети показываются под отцом (если он известен), иначе под матерью.
+func _tree_lines(m, depth: int, out: Array, seen: Dictionary) -> void:
+	if seen.has(m.id) or depth > 12:
+		return
+	seen[m.id] = true
+	var pad := ""
+	for i in depth:
+		pad += "    "
+	var line := "%s%s%s, %d %s" % [pad, "└ " if depth > 0 else "", _person_link(m.id), int(m.age_years), _years_word(int(m.age_years))]
+	if m.partner_id >= 0 or m.children.size() > 0:
+		var pid: int = m.partner_id
+		if pid < 0:
+			for c in m.children:
+				var cm = world.mind_by_id(int(c))
+				if cm != null:
+					pid = cm.father_id if m.sex == "f" else cm.mother_id
+					break
+		if pid >= 0:
+			line += "  +  " + _person_link(pid)
+			var pm = world.mind_by_id(pid)
+			if pm != null and pm.mother_id < 0 and pm.father_id < 0:
+				seen[pid] = true
+	out.append(line)
+	for c in m.children:
+		var cm2 = world.mind_by_id(int(c))
+		if cm2 == null:
+			continue
+		var owner: int = cm2.father_id if cm2.father_id >= 0 else cm2.mother_id
+		if owner == m.id or world.mind_by_id(owner) == null:
+			_tree_lines(cm2, depth + 1, out, seen)
+	# дети этой пары, записанные за супругом (если супруг — тоже корень)
+	if m.partner_id >= 0:
+		var p = world.mind_by_id(m.partner_id)
+		if p != null:
+			for c in p.children:
+				var cm3 = world.mind_by_id(int(c))
+				if cm3 != null and not seen.has(cm3.id) and cm3.father_id != p.id:
+					_tree_lines(cm3, depth + 1, out, seen)
+
+func _draw_chart() -> void:
+	var h: Array = world.pop_history
+	var sz := _chart.size
+	var f := load("res://fonts/NotoSans-Regular.ttf") as Font
+	_chart.draw_rect(Rect2(Vector2.ZERO, sz), Color(0.1, 0.13, 0.19))
+	if h.size() < 2:
+		_chart.draw_string(f, Vector2(10, sz.y / 2), "График появится через пару дней", HORIZONTAL_ALIGNMENT_LEFT, -1, 15)
+		return
+	var mx := 1
+	for e in h:
+		mx = maxi(mx, int(e["pop"]))
+	var pts := PackedVector2Array()
+	for i in h.size():
+		var x: float = 8.0 + (sz.x - 16.0) * i / float(h.size() - 1)
+		var y: float = sz.y - 20.0 - (sz.y - 40.0) * float(h[i]["pop"]) / mx
+		pts.append(Vector2(x, y))
+	_chart.draw_polyline(pts, Color(0.45, 0.85, 0.55), 3.0, true)
+	_chart.draw_string(f, Vector2(8, 16), "Население по дням (макс. %d)" % mx, HORIZONTAL_ALIGNMENT_LEFT, -1, 14, Color(0.8, 0.86, 0.95))
+	_chart.draw_string(f, Vector2(8, sz.y - 4), "день %d" % int(h[0]["d"]), HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(0.6, 0.66, 0.75))
+	_chart.draw_string(f, Vector2(sz.x - 80, sz.y - 4), "день %d" % int(h[-1]["d"]), HORIZONTAL_ALIGNMENT_LEFT, -1, 13, Color(0.6, 0.66, 0.75))
+
 func _toggle_side(mode: String) -> void:
 	if mode == "" or (_side.visible and _side_mode == mode):
 		_side.visible = false
@@ -534,15 +653,61 @@ func _refresh_side() -> void:
 			_side_title.text = "Жители"
 			for r in world.residents:
 				var m = r.mind
-				t += "[url=%d][b]%s[/b][/url]%s — %s\n" % [m.id, m.name, "" if m.alive else " †", m.action_text]
+				t += "[url=%d][b]%s[/b][/url]%s, %s %d — %s\n" % [m.id, m.name, "" if m.alive else " †", m.stage_name(), int(m.age_years), m.action_text]
 				t += "  здоровье %d · сытость %d · вода %d · энергия %d · настроение %d\n\n" % [int(m.health), int(m.food), int(m.water), int(m.energy), int(m.mood)]
 			t += "[color=#9fb3c8]Коснитесь имени, чтобы открыть карточку.[/color]"
+		"family":
+			_side_title.text = "Семьи и родословная"
+			var roots: Array = world.all_minds().filter(func(x): return x.mother_id < 0 and x.father_id < 0)
+			roots.sort_custom(func(a, b): return a.sex == "m" and b.sex != "m")
+			var lines: Array = []
+			var seen := {}
+			for rm in roots:
+				_tree_lines(rm, 0, lines, seen)
+			t += "\n".join(lines) + "\n\n"
+			var couples := 0
+			for r in world.residents:
+				if r.mind.alive and r.mind.partner_id >= 0 and r.mind.sex == "f":
+					couples += 1
+			t += "Пар сейчас: %d · всего создано: %d\n" % [couples, int(world.stats.get("couples", 0))]
+			var trad := {}
+			for r in world.residents:
+				for x in r.mind.traditions:
+					if r.mind.alive:
+						trad[x] = int(trad.get(x, 0)) + 1
+			if not trad.is_empty():
+				t += "\n[b]Традиции[/b]\n"
+				for x in trad:
+					t += "%s — %s (соблюдают: %d)\n" % [Family.TRADITIONS[x]["name"], Family.TRADITIONS[x]["desc"], trad[x]]
+			t += "\n[color=#9fb3c8]† — умер. Коснитесь имени, чтобы открыть карточку. 1 год = 2 игровых дня.[/color]"
 		"world":
-			_side_title.text = "Мир"
-			t += "Seed: %d\n%s\n\n" % [world.seed_value, world.time_string()]
-			t += "Население: %d (всего было %d)\n" % [world.alive_count(), world.residents.size()]
+			_side_title.text = "Мир и демография"
+			t += "Seed: %d · %s · год %d\n\n" % [world.seed_value, world.time_string(), world.current_year()]
+			var stages := {"baby": 0, "child": 0, "teen": 0, "adult": 0, "elder": 0}
+			var gens := {}
+			var age_sum := 0.0
+			for r in world.residents:
+				if r.mind.alive:
+					stages[r.mind.stage()] += 1
+					gens[r.mind.generation] = true
+					age_sum += r.mind.age_years
+			var alive: int = world.alive_count()
+			t += "[b]Население: %d[/b] (предел %d)\n" % [alive, Family.MAX_POP]
+			t += "Младенцы %d · дети %d · подростки %d · взрослые %d · старики %d\n" % [stages["baby"], stages["child"], stages["teen"], stages["adult"], stages["elder"]]
+			t += "Средний возраст: %.1f · поколений среди живых: %d\n" % [age_sum / maxf(1.0, alive), gens.size()]
+			t += "Рождений: %d · смертей: %d\n" % [int(world.stats["births"]), int(world.stats["deaths"])]
+			var db: Dictionary = world.stats["deaths_by"]
+			if not db.is_empty():
+				var parts: Array = []
+				for k in db:
+					parts.append("%s: %d" % [k, int(db[k])])
+				t += "Причины смерти: %s\n" % ", ".join(parts)
+			t += "\n"
 			for tp in Defs.PLACEABLE:
 				t += "%s: %d\n" % [Defs.display_name(tp), world.count_type(tp)]
-			t += "\n[b]Этап развития:[/b] первобытная жизнь\n"
-			t += "[color=#9fb3c8]Семьи, поселения, технологии и космос — следующие этапы разработки, в этой версии их нет.[/color]"
+			t += "\n[b]Этап развития:[/b] первобытные семьи\n"
+			t += "[color=#9fb3c8]Есть: пары, рождение, уход за детьми, наследование, взросление, старость, болезни, традиции. Поселения, ремёсла, технологии и космос — следующие этапы, в этой версии их нет.[/color]"
+	_chart.visible = _side_mode == "world"
+	if _chart.visible:
+		_chart.queue_redraw()
 	_side_text.text = t

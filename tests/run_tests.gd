@@ -3,6 +3,8 @@ extends SceneTree
 ## Проверяют, что механики действительно работают, а не только то, что проект собирается.
 
 const GameWorld = preload("res://scripts/core/game_world.gd")
+const Family = preload("res://scripts/residents/family.gd")
+const Mind = preload("res://scripts/residents/mind.gd")
 
 var failures := 0
 var passed := 0
@@ -165,5 +167,147 @@ func _run() -> void:
 	print("    живы: %d, событий в журнале: %d" % [w4.alive_count(), w4.events.size()])
 	check(w4.alive_count() >= 1, "население выживает 10 дней в стандартном мире")
 
+	_family_tests()
+
 	print("== Итог: %d пройдено, %d с ошибкой ==" % [passed, failures])
 	quit(1 if failures > 0 else 0)
+
+
+# ---------------------------------------------------------------- семьи и поколения
+
+func _family_tests() -> void:
+	print("[семьи: пары]")
+	var w = _make_world(4242)
+	var adam = w.residents[0]
+	var eva = w.residents[1]
+	check(adam.mind.family_name != "" and adam.mind.generation == 1, "у первых людей есть род и поколение 1")
+	check(Family.can_pair(w, adam.mind, eva.mind), "мужчина и женщина без родства могут стать парой")
+	for pair in [[adam, eva], [eva, adam]]:
+		var rl: Dictionary = pair[0].mind.rel(pair[1].mind.id, pair[1].mind.name)
+		rl["affinity"] = 55.0
+		rl["familiarity"] = 30.0
+		rl["talks"] = 3
+	var t0: float = w.time_min
+	while adam.mind.partner_id < 0 and w.time_min - t0 < 4 * 1440:
+		w.step(1.0)
+	check(adam.mind.partner_id == eva.mind.id and eva.mind.partner_id == adam.mind.id,
+		"пара возникает из разговоров (за %.1f ч)" % ((w.time_min - t0) / 60.0))
+
+	print("[семьи: рождение и наследование]")
+	eva.mind.pregnant = true
+	eva.mind.pregnancy_father = adam.mind.id
+	eva.mind.pregnancy_due = w.time_min + 30.0
+	var pop0: int = w.alive_count()
+	_sim(w, 90)
+	check(w.alive_count() == pop0 + 1 and int(w.stats["births"]) >= 1, "беременность заканчивается рождением ребёнка")
+	var kid = w.residents[-1]
+	var k = kid.mind
+	check(k.mother_id == eva.mind.id and k.father_id == adam.mind.id, "у ребёнка записаны мать и отец")
+	check(k.id in eva.mind.children and k.id in adam.mind.children, "ребёнок записан у родителей")
+	check(k.generation == 2 and k.family_name == adam.mind.family_name, "поколение 2, род отца")
+	var inherit_ok := true
+	for tr in k.traits:
+		var lo: float = minf(adam.mind.traits[tr], eva.mind.traits[tr]) - 0.3
+		var hi: float = maxf(adam.mind.traits[tr], eva.mind.traits[tr]) + 0.3
+		if k.traits[tr] < lo or k.traits[tr] > hi:
+			inherit_ok = false
+	check(inherit_ok, "черты ребёнка — в диапазоне родителей с небольшой мутацией")
+	check(k.lifespan > 45.0 and k.lifespan < 90.0, "срок жизни зависит от живучести (%.0f лет)" % k.lifespan)
+	check(k.stage() == "baby" and kid.model.scale.y < 0.6, "младенец меньше взрослого")
+	check(Family.is_close_relative(w, k, eva.mind) and not Family.can_pair(w, k, eva.mind), "с родителями пару создать нельзя")
+
+	print("[семьи: уход за детьми]")
+	k.food = 20.0
+	k.water = 90.0
+	var fed := false
+	for i in 8 * 60:
+		w.step(1.0)
+		if k.food > 50.0:
+			fed = true
+			break
+	check(fed, "голодного младенца кормит взрослый")
+	check(float(eva.mind.skills.get("забота", 0.0)) + float(adam.mind.skills.get("забота", 0.0)) > 0.0, "растёт навык заботы")
+	check(k.alive, "младенец жив")
+
+	print("[семьи: взросление]")
+	k.age_years = Mind.DEPENDENT_AGE - 0.001
+	_sim(w, 10)
+	check(not k.is_dependent() and not k.known_places.is_empty(), "в %d лет ребёнок узнаёт от родителей места (%d)" % [int(Mind.DEPENDENT_AGE), k.known_places.size()])
+	eva.mind.traditions = ["evening_fire"]
+	k.age_years = 11.999
+	_sim(w, 10)
+	check("evening_fire" in k.traditions, "подросток перенимает традицию родителей")
+	k.age_years = Mind.ADULT_AGE - 0.001
+	_sim(w, 10)
+	check(k.is_adult() and absf(kid.model.scale.y - float(k.appearance["height"])) < 0.05, "взрослый — полный рост")
+	var grown := false
+	for mem in k.memory:
+		if mem["kind"] == "grow" and "взросл" in mem["text"]:
+			grown = true
+	check(grown, "взросление записано в память")
+
+	print("[семьи: родство]")
+	eva.mind.pregnant = true
+	eva.mind.pregnancy_father = adam.mind.id
+	eva.mind.pregnancy_due = w.time_min + 5.0
+	_sim(w, 70)
+	var kid2 = w.residents[-1]
+	check(kid2 != kid and kid2.mind.mother_id == eva.mind.id, "родился второй ребёнок")
+	kid2.mind.age_years = 18.0
+	k.age_years = 19.0
+	check(not Family.can_pair(w, k, kid2.mind), "братья и сёстры не создают пару")
+	check(Family.relation_to(w, k, kid2.mind.id) in ["брат", "сестра"], "родство определяется (%s)" % Family.relation_to(w, k, kid2.mind.id))
+
+	print("[семьи: болезни, старость, смерть]")
+	adam.mind.age_years = adam.mind.lifespan + 0.2
+	var died := false
+	for i in 2 * 1440:
+		w.step(1.0)
+		if not adam.mind.alive:
+			died = true
+			break
+	check(died and adam.mind.cause_of_death == "от старости", "старик умирает от старости (%s)" % adam.mind.cause_of_death)
+	check(eva.mind.partner_id == -1, "вдова снова одна")
+	_sim(w, 13 * 60)
+	check(w.resident_by_id(1000) == null and w.mind_by_id(1000) != null, "тело убрано, человек остался в родословной")
+	check(w.count_type("grave") >= 1, "на месте смерти — могила")
+	var sick_ok := false
+	k.illness = "простуда"
+	k.sick_until = w.time_min + 120.0
+	var h0: float = k.health
+	_sim(w, 60)
+	sick_ok = k.health < h0 or k.health < 100.0
+	check(sick_ok, "болезнь отнимает здоровье")
+
+	print("[семьи: сохранение]")
+	var js := JSON.stringify(w.to_dict())
+	var w5 = _make_world(1)
+	var err: String = w5.load_dict(JSON.parse_string(js))
+	check(err == "", "сохранение с семьями загружается")
+	var e5 = w5.resident_by_id(eva.mind.id)
+	check(e5 != null and e5.mind.children.size() == 2, "дети матери сохранены")
+	check(w5.mind_by_id(1000) != null and w5.mind_by_id(1000).cause_of_death == "от старости", "архив родословной сохранён")
+	check(w5.resident_by_id(k.id).mind.father_id == 1000, "отец ребёнка сохранён")
+	check(int(w5.stats["births"]) == int(w.stats["births"]), "демография сохранена")
+	w5.queue_free()
+	w.queue_free()
+
+	print("[семьи: долгий прогон 60 дней = 30 лет]")
+	var t_start := Time.get_ticks_msec()
+	var wl = _make_world(2024)
+	var max_pop := 0
+	for d in 60:
+		_sim(wl, 1440)
+		max_pop = maxi(max_pop, wl.alive_count())
+	var gens := {}
+	for m in wl.all_minds():
+		gens[m.generation] = true
+	print("    живы: %d, макс. %d, рождений %d, смертей %d %s, поколений %d, кустов %d, пар %d, кормлений %d, %.1f с" % [
+		wl.alive_count(), max_pop, int(wl.stats["births"]), int(wl.stats["deaths"]), str(wl.stats["deaths_by"]), gens.size(),
+		wl.count_type("bush"), int(wl.stats["couples"]), int(wl.stats["feedings"]), (Time.get_ticks_msec() - t_start) / 1000.0])
+	check(int(wl.stats["couples"]) >= 1, "в стандартном мире сами возникают пары")
+	check(int(wl.stats["births"]) >= 2, "сами рождаются дети")
+	check(wl.alive_count() > 2, "население выросло")
+	check(max_pop <= Family.MAX_POP, "население не превышает предел")
+	check(gens.size() >= 2, "сменяются поколения")
+	wl.queue_free()

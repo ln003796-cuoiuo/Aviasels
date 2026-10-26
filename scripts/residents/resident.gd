@@ -6,6 +6,7 @@ const Brain = preload("res://scripts/residents/brain.gd")
 const CharacterModel = preload("res://scripts/residents/character_model.gd")
 const M = preload("res://scripts/core/meshes.gd")
 const Defs = preload("res://scripts/core/object_defs.gd")
+const Family = preload("res://scripts/residents/family.gd")
 
 const WALK_SPEED := 0.5   # единиц мира за игровую минуту
 const RUN_SPEED := 0.95
@@ -28,6 +29,12 @@ var _think_t := 0.0
 var _plan_urgency := 0.0
 var _exchange_t := 0.0
 var _shared_this_talk := false
+var _stage := ""
+var env_t := 0.0
+var env_fire := false
+var env_campfire := false
+var _was_dependent := false
+var _model_pregnant := false
 
 var model
 var _label: Label3D
@@ -47,6 +54,8 @@ func setup(w, data: Dictionary) -> void:
 	position = sim_pos
 	rng.seed = hash(str(world.seed_value) + mind.name + str(mind.id))
 	name = "Resident_%d" % mind.id
+	_stage = mind.stage()
+	_was_dependent = mind.is_dependent()
 	_build_visual()
 	if not mind.alive:
 		model.set_dead_look()
@@ -90,6 +99,15 @@ func set_plan(plan: Array, urgency: float) -> void:
 func sim_step(dt: float) -> void:
 	if not mind.alive:
 		return
+	mind.age_years += dt / Mind.YEAR_MIN
+	var st: String = mind.stage()
+	if st != _stage:
+		var old := _stage
+		_stage = st
+		Family.on_stage_change(world, self, old, st)
+	if _was_dependent and not mind.is_dependent():
+		_was_dependent = false
+		Family.on_independent(world, self)
 	Brain.update_needs(self, dt / 60.0)
 	if mind.health <= 0.0:
 		_die()
@@ -155,11 +173,17 @@ func _execute(dt: float) -> void:
 			_step_t += dt
 			if _step_t >= float(step["dur"]):
 				mind.add_skill("выживание", 0.5)
+				if world.hour_f() >= 17.0 or world.hour_f() < 1.0:
+					mind.habit["fire_evenings"] = int(mind.habit.get("fire_evenings", 0)) + 1
 				_advance()
 		"look":
 			_step_t += dt
 			if _step_t >= float(step["dur"]):
 				_advance()
+		"gather":
+			_do_gather(step, dt)
+		"feed":
+			_do_feed(step)
 		_:
 			_advance()
 
@@ -217,7 +241,7 @@ func _do_go(step: Dictionary, dt: float) -> void:
 				mind.remember(world.time_min, "blocked", "Не смог%s пройти к цели — путь перекрыт" % g("", "ла"), 0.4)
 			_fail("нет пути")
 			return
-	var speed := (RUN_SPEED if step.get("run", false) else WALK_SPEED) * dt
+	var speed := (RUN_SPEED if step.get("run", false) else WALK_SPEED) * dt * speed_factor()
 	if mind.energy < 15.0:
 		speed *= 0.7
 	while speed > 0.0 and not _path.is_empty():
@@ -241,6 +265,63 @@ func _do_go(step: Dictionary, dt: float) -> void:
 			_pathed = false
 		else:
 			_advance()
+
+## Скорость зависит от возраста, беременности и болезни.
+func speed_factor() -> float:
+	var f: float = {"baby": 0.6, "child": 0.85, "teen": 1.0, "adult": 1.0, "elder": 0.75}.get(mind.stage(), 1.0)
+	if mind.pregnant: f *= 0.85
+	if mind.is_sick(world.time_min): f *= 0.8
+	return f
+
+## Набрать еду/воду, чтобы отнести ребёнку.
+func _do_gather(step: Dictionary, dt: float) -> void:
+	var o = world.get_object(int(step["obj"]))
+	var need: String = step["need"]
+	if o == null:
+		_fail_place(int(step["obj"]), "bush" if need == "food" else "spring")
+		return
+	_step_t += dt
+	if _step_t < 8.0:
+		return
+	if need == "food":
+		var got: int = o.take_food(2)
+		mind.know_place(o.obj_id, o.obj_type, o.position, o.amount, world.time_min)
+		if got <= 0:
+			_fail("ягод нет")
+			return
+		mind.carry["food"] = int(mind.carry.get("food", 0)) + got
+		mind.add_skill("собирательство", 0.6)
+	else:
+		mind.carry["water"] = 2
+	_advance()
+
+## Накормить/напоить ребёнка.
+func _do_feed(step: Dictionary) -> void:
+	var c = world.resident_by_id(int(step["rid"]))
+	var need: String = step["need"]
+	if c == null or not c.mind.alive:
+		mind.carry[need] = 0
+		_fail("ребёнка нет рядом")
+		return
+	var n: int = int(mind.carry.get(need, 0))
+	if n <= 0:
+		_fail("нечего дать")
+		return
+	if need == "food":
+		c.mind.food = minf(100.0, c.mind.food + n * 22.0)
+	else:
+		c.mind.water = minf(100.0, c.mind.water + n * 30.0)
+	mind.carry[need] = 0
+	mind.add_skill("забота", 1.0)
+	c.remove_meta("care_by")
+	var rc: Dictionary = c.mind.rel(mind.id, mind.name)
+	rc["affinity"] = minf(100.0, float(rc["affinity"]) + 2.0)
+	rc["familiarity"] = minf(100.0, float(rc["familiarity"]) + 1.0)
+	var who: String = Family.relation_to(world, c.mind, mind.id)
+	c.mind.remember(world.time_min, "cared", "%s %s меня" % [(who.capitalize() + " " if who != "" else "") + mind.name, ("накормил" if need == "food" else "напоил") + g("", "а")], 0.3)
+	say("Держи, %s." % c.mind.name if need == "food" else "Попей, %s." % c.mind.name)
+	world.stats["feedings"] = int(world.stats.get("feedings", 0)) + 1
+	_advance()
 
 func _flat_dist(p: Vector3) -> float:
 	return Vector2(p.x - sim_pos.x, p.z - sim_pos.z).length()
@@ -290,6 +371,9 @@ func _do_sleep(step: Dictionary, dt: float) -> void:
 		mind.sleeping = false
 		if _step_t > 120.0 and obj_id >= 0:
 			mind.mood = minf(100.0, mind.mood + 6.0)
+			mind.habit["hut_nights"] = int(mind.habit.get("hut_nights", 0)) + 1
+		elif _step_t > 120.0 and "hut_sleep" in mind.traditions:
+			mind.mood = maxf(0.0, mind.mood - 6.0)
 		_advance()
 
 func _do_talk_request(step: Dictionary) -> void:
@@ -406,6 +490,7 @@ func _exchange(other) -> bool:
 				say(Brain.dialogue(self, other, "share", what))
 				b.remember(world.time_min, "learn", "%s рассказал%s, где %s" % [a.name, g("", "а"), what], 0.5)
 				world.log_event("%s рассказывает %s, где %s" % [a.name, other.dative(), what])
+				a.habit["shared"] = int(a.habit.get("shared", 0)) + 1
 				shared = true
 				_shared_this_talk = true
 				break
@@ -422,6 +507,7 @@ func _exchange(other) -> bool:
 		a.remember(world.time_min, "bond", "Мы с %s теперь: %s" % [b.name, after_a.to_lower()], 0.9)
 		b.remember(world.time_min, "bond", "Мы с %s теперь: %s" % [a.name, after_a.to_lower()], 0.9)
 		world.log_event("%s и %s теперь %s" % [a.name, b.name, after_a.to_lower()])
+	Family.on_talk(world, self, other, ra, rb)
 	return true
 
 func _end_talk(_normal: bool) -> void:
@@ -440,7 +526,18 @@ func _die() -> void:
 	mind.plan = []
 	mind.sleeping = false
 	mind.action_text = "Умер" if mind.sex == "m" else "Умерла"
-	var cause := "от жажды" if mind.water <= 0.0 else ("от голода" if mind.food <= 0.0 else "от ран")
+	var cause := "от ран"
+	if mind.age_years >= mind.lifespan:
+		cause = "от старости"
+	elif mind.water <= 0.0:
+		cause = "от жажды"
+	elif mind.food <= 0.0:
+		cause = "от голода"
+	elif mind.is_sick(world.time_min):
+		cause = "от болезни (%s)" % mind.illness
+	mind.cause_of_death = cause
+	mind.died_at = world.time_min
+	mind.pregnant = false
 	mind.remember(world.time_min, "death", "Смерть " + cause, 1.0)
 	world.on_resident_died(self, cause)
 	_end_talk(false)
@@ -462,7 +559,12 @@ func _update_action_text() -> void:
 			elif step.has("seek"): mind.action_text = "Ищет " + ("воду" if step["seek"] == "spring" else "еду")
 			elif step.has("rid"):
 				var o = world.resident_by_id(int(step["rid"]))
-				mind.action_text = "Идёт к " + (o.mind.name if o else "собеседнику")
+				if mind.goal == "care":
+					mind.action_text = "Несёт еду: " + (o.mind.name if o else "ребёнку")
+				elif mind.goal == "follow":
+					mind.action_text = "Идёт за: " + (o.mind.name if o else "родными")
+				else:
+					mind.action_text = "Идёт к " + (o.mind.name if o else "собеседнику")
 			elif step.get("explore", false): mind.action_text = "Исследует местность"
 			else: mind.action_text = "Идёт: " + Brain.goal_name(mind.goal)
 		"eat": mind.action_text = "Ест ягоды"
@@ -473,15 +575,33 @@ func _update_action_text() -> void:
 			mind.action_text = "Разговаривает с " + (o2.mind.name if o2 else "кем-то")
 		"talk_request": mind.action_text = "Заговаривает"
 		"rest": mind.action_text = "Греется у костра"
-		"look": mind.action_text = "Осматривается"
+		"look": mind.action_text = "Осматривается" if mind.goal != "follow" else "Держится рядом с родными"
+		"gather": mind.action_text = "Собирает " + ("ягоды" if step["need"] == "food" else "воду") + " для ребёнка"
+		"feed": mind.action_text = "Кормит ребёнка" if step["need"] == "food" else "Поит ребёнка"
 		_: mind.action_text = "Думает"
 
 # ---------------------------------------------------------------- визуал
 
-func _build_visual() -> void:
+## Перестроить модель (смена возраста, беременность).
+func refresh_model() -> void:
+	if model == null:
+		return
+	model.queue_free()
+	remove_child(model)
+	_make_model()
+	if not mind.alive:
+		model.set_dead_look()
+
+func _make_model() -> void:
 	model = CharacterModel.new()
-	model.build(mind.appearance, mind.sex)
+	_model_pregnant = mind.pregnant
+	model.build(mind.appearance, mind.sex, mind.stage(), mind.pregnant)
 	add_child(model)
+	if _label:
+		_label.position.y = 2.15 * model.scale.y + 0.15
+
+func _build_visual() -> void:
+	_make_model()
 	_ring = M.add(self, M.torus(0.45, 0.6), M.mat(Color(1.0, 0.85, 0.2), 1.5), Vector3(0, 0.05, 0))
 	_ring.visible = false
 	_ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
@@ -493,7 +613,7 @@ func _build_visual() -> void:
 	_label.outline_size = 10
 	_label.pixel_size = 0.006
 	_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	_label.position = Vector3(0, 2.15, 0)
+	_label.position = Vector3(0, 2.15 * model.scale.y + 0.15, 0)
 	_label.modulate = Color(1, 1, 1)
 	add_child(_label)
 	_bubble = Label3D.new()

@@ -14,13 +14,18 @@ var _phase := 0.0
 var _t := 0.0
 var _parts: Array = []
 
-func build(appearance: Dictionary, sex: String) -> void:
+## Масштаб тела по возрастному этапу.
+const STAGE_SCALE := {"baby": 0.42, "child": 0.62, "teen": 0.86, "adult": 1.0, "elder": 0.96}
+
+func build(appearance: Dictionary, sex: String, stage: String = "adult", pregnant: bool = false) -> void:
 	var skin: Color = Color(appearance.get("skin", "#e0b48c"))
 	var hair: Color = Color(appearance.get("hair", "#3b2414"))
+	if stage == "elder":
+		hair = hair.lerp(Color(0.82, 0.82, 0.8), 0.75)
 	var shirt: Color = Color(appearance.get("shirt", "#3f7fbf"))
 	var pants: Color = Color(appearance.get("pants", "#4a3b2a"))
 	var hscale: float = float(appearance.get("height", 1.0))
-	scale = Vector3.ONE * hscale
+	scale = Vector3.ONE * hscale * float(STAGE_SCALE.get(stage, 1.0))
 	_body = Node3D.new()
 	add_child(_body)
 	var female := sex == "f"
@@ -31,6 +36,8 @@ func build(appearance: Dictionary, sex: String) -> void:
 		_parts.append(M.add(leg, M.box(Vector3(0.12, 0.07, 0.22)), M.mat(Color(0.25, 0.17, 0.1)), Vector3(0, -0.79, 0.04)))
 	# торс
 	_parts.append(M.add(_body, M.capsule(0.19 if not female else 0.17, 0.62), M.mat(shirt), Vector3(0, 1.12, 0), Vector3(1.0, 1.0, 0.75)))
+	if pregnant:
+		_parts.append(M.add(_body, M.sphere(0.16, 0.3, 12), M.mat(shirt), Vector3(0, 1.0, 0.1)))
 	if female:
 		_parts.append(M.add(_body, M.cyl(0.17, 0.3, 0.35, 12), M.mat(shirt.darkened(0.15)), Vector3(0, 0.82, 0)))
 	# руки (поворот в плече)
@@ -47,6 +54,9 @@ func build(appearance: Dictionary, sex: String) -> void:
 	_parts.append(M.add(_head, M.sphere(0.155, 0.2, 14), M.mat(hair), Vector3(0, 0.2, -0.015)))
 	if female:
 		_parts.append(M.add(_head, M.capsule(0.12, 0.45), M.mat(hair), Vector3(0, 0.0, -0.1), Vector3(1.1, 1.0, 0.6)))
+	if stage in ["baby", "child"]:
+		_head.scale = Vector3.ONE * (1.45 if stage == "baby" else 1.22)
+		_head.position.y = 1.6
 	for sx in [-1, 1]:
 		M.add(_head, M.sphere(0.022, -1, 6), M.mat(Color(0.08, 0.08, 0.1)), Vector3(0.055 * sx, 0.13, 0.135))
 	for p in _parts:

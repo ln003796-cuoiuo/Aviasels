@@ -3,6 +3,7 @@ extends RefCounted
 ## Работает только с общим состоянием мира, без случайного выбора анимаций.
 
 const Defs = preload("res://scripts/core/object_defs.gd")
+const Family = preload("res://scripts/residents/family.gd")
 
 const PERCEPTION := 11.0
 
@@ -15,22 +16,33 @@ const SOCIAL_PER_H := 3.5
 static func update_needs(r, hours: float) -> void:
 	var m = r.mind
 	var w = r.world
-	var near_fire := false
-	var near_campfire := false
-	for o in w.objects_near(r.sim_pos, 4.0):
-		if o.is_dangerous() and o.position.distance_to(r.sim_pos) < 2.6:
-			near_fire = true
-		if o.obj_type == "campfire":
-			near_campfire = true
+	# окружение пересчитывается раз в 3 игровые минуты (экономия на телефоне)
+	r.env_t -= hours * 60.0
+	if r.env_t <= 0.0:
+		r.env_t = 3.0
+		r.env_fire = false
+		r.env_campfire = false
+		for o in w.objects_near(r.sim_pos, 4.0):
+			if o.is_dangerous() and o.position.distance_to(r.sim_pos) < 2.6:
+				r.env_fire = true
+			if o.obj_type == "campfire":
+				r.env_campfire = true
+	var near_fire: bool = r.env_fire
+	var near_campfire: bool = r.env_campfire
 	var sleep_mul: float = 0.55 if m.sleeping else 1.0
-	m.food = clampf(m.food - FOOD_PER_H * hours * sleep_mul, 0.0, 100.0)
-	m.water = clampf(m.water - WATER_PER_H * hours * sleep_mul, 0.0, 100.0)
+	var st: String = m.stage()
+	var body_mul: float = {"baby": 0.7, "child": 0.85, "teen": 1.0, "adult": 1.0, "elder": 0.9}.get(st, 1.0)
+	if m.pregnant: body_mul *= 1.2
+	m.food = clampf(m.food - FOOD_PER_H * hours * sleep_mul * body_mul, 0.0, 100.0)
+	m.water = clampf(m.water - WATER_PER_H * hours * sleep_mul * body_mul, 0.0, 100.0)
 	if m.sleeping:
 		var in_hut: bool = r.current_step().get("obj", -1) >= 0
 		m.energy = clampf(m.energy + (22.0 if in_hut else 13.0) * hours, 0.0, 100.0)
 	else:
 		var walk_extra: float = 2.0 if r.is_moving else 0.0
-		m.energy = clampf(m.energy - (ENERGY_PER_H + walk_extra) * hours, 0.0, 100.0)
+		var tire: float = 1.3 if st in ["baby", "elder"] else 1.0
+		if m.pregnant or m.is_sick(w.time_min): tire *= 1.25
+		m.energy = clampf(m.energy - (ENERGY_PER_H + walk_extra) * tire * hours, 0.0, 100.0)
 	if r.talk_partner_id < 0:
 		m.social = clampf(m.social - SOCIAL_PER_H * hours * (0.5 + m.traits["sociability"]), 0.0, 100.0)
 	# здоровье
@@ -39,15 +51,24 @@ static func update_needs(r, hours: float) -> void:
 	if m.water <= 0.0: dmg += 9.0
 	if m.energy <= 0.0: dmg += 2.0
 	if near_fire: dmg += 40.0
+	var sick: bool = m.is_sick(w.time_min)
+	if sick:
+		dmg += 0.7 if m.sleeping else 1.4
+	if m.age_years >= m.lifespan:
+		dmg += 4.0 + (m.age_years - m.lifespan) * 4.0   # тело изнашивается
 	if dmg > 0.0:
 		m.health = clampf(m.health - dmg * hours, 0.0, 100.0)
 	elif m.food > 30.0 and m.water > 30.0 and m.energy > 20.0:
-		m.health = clampf(m.health + 2.5 * hours, 0.0, 100.0)
+		m.health = clampf(m.health + (1.0 if st == "elder" else 2.5) * hours, 0.0, 100.0)
+	if not sick and m.illness != "":
+		m.remember(w.time_min, "recover", r.g("Выздоровел", "Выздоровела") + " (" + m.illness + ")", 0.5)
+		m.illness = ""
 	# настроение тянется к общему благополучию
 	var target: float = m.food * 0.22 + m.water * 0.22 + m.energy * 0.18 + m.social * 0.18 + m.health * 0.2
 	if near_campfire: target += 12.0
 	if near_fire: target -= 40.0
 	if m.is_in_danger_zone(r.sim_pos, w.time_min): target -= 15.0
+	if sick: target -= 10.0
 	target += (m.traits["calm"] - 0.5) * 10.0
 	m.mood = clampf(lerpf(m.mood, target, clampf(0.15 * hours, 0.0, 1.0)), 0.0, 100.0)
 
@@ -111,13 +132,18 @@ static func evaluate(r) -> Array:
 	var water_need: float = (100.0 - m.water) / 100.0
 	var food_need: float = (100.0 - m.food) / 100.0
 	var energy_need: float = (100.0 - m.energy) / 100.0
+	if m.is_dependent():
+		_evaluate_child(r, out, energy_need)
+		return out
 	out.append({"goal": "drink", "u": water_need * water_need * 1.6 + (0.6 if m.water < 25.0 else 0.0),
 		"reason": "Хочется пить (вода %d%%)" % int(m.water)})
 	out.append({"goal": "eat", "u": food_need * food_need * 1.5 + (0.5 if m.food < 25.0 else 0.0),
 		"reason": "Голод (сытость %d%%)" % int(m.food)})
 	var night_bonus := 0.0
-	if w.is_night() and m.energy < 85.0:
+	if (w.is_night() or ("hut_sleep" in m.traditions and w.hour_f() >= 20.0)) and m.energy < 85.0:
 		night_bonus = 0.55
+	if m.is_sick(w.time_min):
+		night_bonus += 0.35
 	out.append({"goal": "sleep", "u": energy_need * energy_need * 1.4 + night_bonus + (0.6 if m.energy < 15.0 else 0.0),
 		"reason": ("Ночь, пора спать" if night_bonus > 0.0 else "Усталость") + " (энергия %d%%)" % int(m.energy)})
 	var partner = _best_partner(r) if w.time_min >= r.talk_cooldown_until else null
@@ -127,8 +153,23 @@ static func evaluate(r) -> Array:
 		soc += clampf(float(rel["affinity"]) / 200.0, -0.2, 0.25)
 		if w.is_night(): soc *= 0.3
 		out.append({"goal": "socialize", "u": soc, "reason": "Хочется пообщаться с %s" % partner.mind.name, "target": partner.mind.id})
-	if m.mood < 55.0 and not m.places_of("campfire").is_empty():
-		out.append({"goal": "rest", "u": (55.0 - m.mood) / 55.0 * 0.8 + 0.1, "reason": "Плохое настроение — отдохнуть у костра"})
+	if not m.places_of("campfire").is_empty():
+		if m.mood < 55.0:
+			out.append({"goal": "rest", "u": (55.0 - m.mood) / 55.0 * 0.8 + 0.1, "reason": "Плохое настроение — отдохнуть у костра"})
+		elif "evening_fire" in m.traditions and w.hour_f() >= 18.0 and w.hour_f() < 21.0:
+			out.append({"goal": "rest", "u": 0.5, "reason": "Традиция рода — вечер у костра"})
+	# забота о детях
+	var kids: Array = Family.care_targets(r)
+	if not kids.is_empty():
+		var kid = kids[0]
+		for k in kids:
+			if minf(k.mind.food, k.mind.water) < minf(kid.mind.food, kid.mind.water):
+				kid = k
+		var low: float = minf(kid.mind.food, kid.mind.water)
+		var cu: float = pow((100.0 - low) / 100.0, 2.0) * 1.6 + 0.35 + (0.6 if low < 25.0 else 0.0)
+		var who: String = Family.relation_to(w, m, kid.mind.id)
+		out.append({"goal": "care", "u": cu, "target": kid.mind.id,
+			"reason": "%s %s хочет %s" % [who.capitalize() if who != "" else "Ребёнок", kid.mind.name, "есть" if kid.mind.food <= kid.mind.water else "пить"]})
 	var explore: float = 0.12 + m.traits["curiosity"] * 0.3
 	if m.places_of("spring").is_empty() or m.places_of("bush").is_empty():
 		explore += 0.25
@@ -148,8 +189,56 @@ static func _best_partner(r):
 		if float(rel["affinity"]) < -60.0:
 			continue
 		var score: float = float(rel["affinity"]) - o.sim_pos.distance_to(r.sim_pos)
+		if o.mind.id == r.mind.partner_id:
+			score += 25.0
+		elif float(rel.get("romance", 0.0)) > 0.0 and Family.can_pair(r.world, r.mind, o.mind):
+			score += 10.0 + float(rel["romance"]) * 0.3
 		if score > best_score:
 			best_score = score
+			best = o
+	return best
+
+## Цели маленьких детей: держаться рядом со взрослыми, спать, играть; кормят их родители.
+static func _evaluate_child(r, out: Array, energy_need: float) -> void:
+	var m = r.mind
+	var w = r.world
+	var night_bonus: float = 0.6 if (w.is_night() and m.energy < 90.0) else 0.0
+	out.append({"goal": "sleep", "u": energy_need * energy_need * 1.6 + night_bonus + (0.6 if m.energy < 15.0 else 0.0),
+		"reason": "Малыш устал" if m.stage() == "baby" else "Пора спать"})
+	var cg = caregiver_of(r)
+	if cg != null:
+		var d: float = cg.sim_pos.distance_to(r.sim_pos)
+		out.append({"goal": "follow", "u": 0.15 + clampf((d - 2.5) / 6.0, 0.0, 1.2), "target": cg.mind.id,
+			"reason": "Держаться рядом: %s" % cg.mind.name})
+		if m.stage() != "baby" and not w.is_night():
+			out.append({"goal": "play", "u": 0.2 + m.traits["curiosity"] * 0.25, "target": cg.mind.id, "reason": "Хочется поиграть"})
+	if m.age_years >= 4.0:
+		# подросший ребёнок уже может сам сорвать ягоды или попить рядом
+		for pair in [["drink", "spring", m.water], ["eat", "bush", m.food]]:
+			var near: Array = _sorted_places(r, pair[1]).filter(func(p): return Vector2(p["x"] - r.sim_pos.x, p["z"] - r.sim_pos.z).length() < 8.0)
+			if not near.is_empty() and float(pair[2]) < 60.0:
+				out.append({"goal": pair[0], "u": pow((100.0 - float(pair[2])) / 100.0, 2.0) * 1.4, "reason": "Рядом есть " + ("вода" if pair[0] == "drink" else "ягоды")})
+	if m.stage() != "baby" and w.time_min >= r.talk_cooldown_until:
+		var partner = _best_partner(r)
+		if partner != null and partner.sim_pos.distance_to(r.sim_pos) < 8.0 and not w.is_night():
+			out.append({"goal": "socialize", "u": (100.0 - m.social) / 100.0 * 0.6, "reason": "Поговорить с %s" % partner.mind.name, "target": partner.mind.id})
+
+## Кто присматривает за ребёнком: мать, отец, родственник или ближайший взрослый.
+static func caregiver_of(r):
+	var m = r.mind
+	var w = r.world
+	for pid in [m.mother_id, m.father_id]:
+		var p = w.resident_by_id(pid)
+		if p != null and p.mind.alive:
+			return p
+	var best = null
+	var bd := INF
+	for o in w.residents:
+		if o == r or not o.mind.alive or o.mind.age_years < 13.0:
+			continue
+		var d: float = o.sim_pos.distance_to(r.sim_pos) - (30.0 if Family.is_close_relative(w, m, o.mind) else 0.0)
+		if d < bd:
+			bd = d
 			best = o
 	return best
 
@@ -173,7 +262,8 @@ static func decide(r) -> void:
 static func goal_name(g: String) -> String:
 	return {"flee": "спастись от огня", "drink": "попить", "eat": "поесть", "sleep": "поспать",
 		"socialize": "пообщаться", "rest": "отдохнуть у костра", "explore": "исследовать",
-		"idle": "осмотреться", "talk": "разговор"}.get(g, g)
+		"idle": "осмотреться", "talk": "разговор", "care": "позаботиться о ребёнке", "follow": "держаться рядом",
+		"play": "поиграть"}.get(g, g)
 
 ## Построить план для цели. Пустой план — цель сейчас недостижима.
 static func build_plan(r, c: Dictionary) -> Array:
@@ -194,8 +284,54 @@ static func build_plan(r, c: Dictionary) -> Array:
 			return _plan_resource(r, "spring", "drink", 10.0)
 		"eat":
 			return _plan_resource(r, "bush", "eat", 15.0)
+		"care":
+			var kid = w.resident_by_id(int(c.get("target", -1)))
+			if kid == null:
+				return []
+			var need: String = "food" if kid.mind.food <= kid.mind.water else "water"
+			var plan: Array = []
+			if int(m.carry.get(need, 0)) <= 0:
+				var src: Array = _sorted_places(r, "bush" if need == "food" else "spring")
+				if src.is_empty():
+					return []
+				var sp: Dictionary = src[0]
+				plan.append({"a": "go", "x": sp["x"], "z": sp["z"], "obj": sp["id"], "near": 1.6 if need == "food" else 1.9})
+				plan.append({"a": "gather", "obj": sp["id"], "need": need})
+			plan.append({"a": "go", "rid": kid.mind.id, "near": 1.3})
+			plan.append({"a": "feed", "rid": kid.mind.id, "need": need})
+			kid.set_meta("care_by", m.id)
+			kid.set_meta("care_until", w.time_min + 150.0)
+			return plan
+		"follow":
+			return [{"a": "go", "rid": c.get("target", -1), "near": 2.0}, {"a": "look", "dur": 15.0}]
+		"play":
+			var cg = w.resident_by_id(int(c.get("target", -1)))
+			if cg == null:
+				return []
+			var a: float = r.rng.randf() * TAU
+			var pt: Vector3 = cg.sim_pos + Vector3(cos(a), 0, sin(a)) * r.rng.randf_range(2.0, 5.0)
+			if not w.nav.is_walkable(pt):
+				return []
+			return [{"a": "go", "x": pt.x, "z": pt.z, "near": 1.0, "explore": true}, {"a": "look", "dur": 8.0}]
 		"sleep":
+			if m.is_dependent():
+				var cg2 = caregiver_of(r)
+				if cg2 != null and cg2.mind.sleeping and int(cg2.current_step().get("obj", -1)) >= 0:
+					var hid: int = int(cg2.current_step()["obj"])
+					var ho = w.get_object(hid)
+					if ho != null:
+						return [{"a": "go", "x": ho.position.x, "z": ho.position.z, "obj": hid, "near": 2.2}, {"a": "sleep", "obj": hid}]
+				return [{"a": "sleep", "obj": -1}]
 			var huts: Array = _sorted_places(r, "hut")
+			var pr = w.resident_by_id(m.partner_id)
+			if pr != null and pr.mind.alive and pr.mind.sleeping and int(pr.current_step().get("obj", -1)) >= 0:
+				var phid: int = int(pr.current_step()["obj"])
+				for i in huts.size():
+					if int(huts[i]["id"]) == phid:
+						var hh: Dictionary = huts[i]
+						huts.remove_at(i)
+						huts.push_front(hh)
+						break
 			if not huts.is_empty():
 				var h: Dictionary = huts[0]
 				return [{"a": "go", "x": h["x"], "z": h["z"], "obj": h["id"], "near": 2.2}, {"a": "sleep", "obj": h["id"]}]

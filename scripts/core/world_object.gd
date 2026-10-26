@@ -11,6 +11,7 @@ var amount: float = 0.0
 var age_h: float = 0.0
 var variant: float = 0.5  # детерминированный разброс внешнего вида
 var burning: float = 0.0  # для деревьев/кустов, задетых пожаром (часы горения)
+var label: String = ""    # подпись (для могил: имя и годы жизни)
 
 var _visual: Node3D
 var _berries: Array = []
@@ -26,13 +27,14 @@ func setup(id: int, t: String, pos: Vector3, data: Dictionary = {}) -> void:
 	amount = float(data.get("amount", Defs.max_amount(t)))
 	age_h = float(data.get("age_h", 0.0))
 	burning = float(data.get("burning", 0.0))
+	label = str(data.get("label", ""))
 	rotation.y = float(data.get("rot", variant * TAU))
 	name = "%s_%d" % [t, id]
 	_build()
 
 func to_dict() -> Dictionary:
 	return {"id": obj_id, "type": obj_type, "x": position.x, "y": position.y, "z": position.z,
-		"amount": amount, "age_h": age_h, "variant": variant, "rot": rotation.y, "burning": burning}
+		"amount": amount, "age_h": age_h, "variant": variant, "rot": rotation.y, "burning": burning, "label": label}
 
 func display_name() -> String:
 	return Defs.display_name(obj_type)
@@ -50,6 +52,8 @@ func describe() -> String:
 			s += " — укрытие для сна"
 		"campfire":
 			s += " — тепло и отдых"
+		"grave":
+			s += ": " + label
 	if burning > 0.0:
 		s += " (горит)"
 	return s
@@ -134,6 +138,9 @@ func _build() -> void:
 			M.add(_visual, M.box(Vector3(2.2, 1.4, 2.2)), M.mat(Color(0.55, 0.4, 0.25)), Vector3(0, 0.7, 0))
 			M.add(_visual, M.prism(Vector3(2.7, 1.2, 2.6)), M.mat(Color(0.75, 0.62, 0.3)), Vector3(0, 2.0, 0))
 			M.add(_visual, M.box(Vector3(0.6, 1.0, 0.05)), M.mat(Color(0.2, 0.12, 0.06)), Vector3(0, 0.5, 1.11))
+		"grave":
+			M.add(_visual, M.box(Vector3(0.7, 0.18, 1.3)), M.mat(Color(0.38, 0.3, 0.2)), Vector3(0, 0.09, 0))
+			M.add(_visual, M.box(Vector3(0.5, 0.6, 0.12)), M.mat(Color(0.5, 0.5, 0.52)), Vector3(0, 0.4, -0.6))
 		"campfire":
 			for i in 4:
 				M.add(_visual, M.cyl(0.07, 0.07, 0.8, 6), M.mat(Color(0.35, 0.22, 0.12)), Vector3(0, 0.08, 0), Vector3.ONE, Vector3(PI / 2, i * PI / 4, 0))

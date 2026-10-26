@@ -8,7 +8,26 @@ func _run():
 	root.add_child(main)
 	await process_frame
 	main.world.time_min = float(args[2]) * 60.0 if args.size() > 2 else 9.5 * 60.0
+	var mode: String = args[1] if args.size() > 1 else ""
+	if mode in ["family", "demo", "kid"]:
+		main.world.new_world(2024)
+		for i in 44 * 1440: main.world.step(1.0)
+		main.world.time_min = floor(main.world.time_min / 1440.0) * 1440.0 + (float(args[2]) if args.size() > 2 else 10.0) * 60.0
 	for i in 40: main.world.step(1.0)
+	if mode == "family":
+		main.hud._toggle_side("family")
+	elif mode == "demo":
+		main.hud._toggle_side("world")
+	elif mode == "kid":
+		var kid = null
+		for r in main.world.residents:
+			if r.mind.alive and (kid == null or r.mind.age_years < kid.mind.age_years):
+				kid = r
+		if kid == null:
+			kid = main.world.residents[-1]
+		main.select(kid)
+		main.camera.focus_on(kid.sim_pos, 7.0)
+		main.toggle_follow()
 	if args.size() > 1 and args[1] == "select":
 		main.select(main.world.residents[0])
 		main.camera.focus_on(main.world.residents[0].sim_pos, 9.0)
