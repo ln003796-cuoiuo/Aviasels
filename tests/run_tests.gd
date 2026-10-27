@@ -5,6 +5,7 @@ extends SceneTree
 const GameWorld = preload("res://scripts/core/game_world.gd")
 const Family = preload("res://scripts/residents/family.gd")
 const Mind = preload("res://scripts/residents/mind.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 var failures := 0
 var passed := 0
@@ -174,6 +175,7 @@ func _run() -> void:
 	check(w4.alive_count() >= 1, "население выживает 10 дней в стандартном мире")
 
 	_family_tests()
+	_settlement_tests()
 
 	print("== Итог: %d пройдено, %d с ошибкой ==" % [passed, failures])
 	quit(1 if failures > 0 else 0)
@@ -316,4 +318,144 @@ func _family_tests() -> void:
 	check(wl.alive_count() > 2, "население выросло")
 	check(max_pop <= Family.MAX_POP, "население не превышает предел")
 	check(gens.size() >= 2, "сменяются поколения")
+	check(int(wl.settlement["built"]) >= 4, "жители сами построили поселение (построек: %d, хижин: %d)" % [int(wl.settlement["built"]), Settlement.built_count(wl, "hut")])
+	check(wl.settlement["name"] != "" and int(wl.settlement["level"]) >= 1, "поселение основано: «%s», %s" % [wl.settlement["name"], Settlement.level_name(wl)])
+	check(wl.count_type("tree") >= 60, "лес не вырублен подчистую (деревьев: %d)" % wl.count_type("tree"))
 	wl.queue_free()
+
+
+# ---------------------------------------------------------------- поселение
+
+func _settlement_tests() -> void:
+	print("[поселение: решение строить]")
+	var w = _make_world(4242)
+	var adam = w.residents[0]
+	var eva = w.residents[1]
+	var site = null
+	for i in 12 * 60:
+		w.step(1.0)
+		var ss: Array = Settlement.sites(w)
+		if not ss.is_empty():
+			site = ss[0]
+			break
+	check(site != null, "жители сами решают построить (%s)" % w.settlement["plan_note"])
+	check(site != null and site.ext["target"] == "hut" and int(site.ext["need_wood"]) > 0, "первая стройка — хижина, нужна древесина")
+	check(w.settlement["has_center"] and Settlement.center(w).length() < 50.0, "выбран центр поселения")
+
+	print("[поселение: добыча и стройка]")
+	var trees0: int = 0
+	for o in w.objects.values():
+		if o.obj_type == "tree":
+			trees0 += int(o.amount)
+	var hut = null
+	var saw_chop := false
+	var saw_carry := false
+	for i in 2 * 1440:
+		w.step(1.0)
+		for r in [adam, eva]:
+			if r.current_step().get("a", "") == "chop": saw_chop = true
+			if int(r.mind.carry.get("wood", 0)) > 0: saw_carry = true
+		for o in w.objects.values():
+			if o.obj_type == "hut" and not o.ext.get("built_by", []).is_empty():
+				hut = o
+		if hut != null:
+			break
+	var trees1: int = 0
+	for o in w.objects.values():
+		if o.obj_type == "tree":
+			trees1 += int(o.amount)
+	check(saw_chop and saw_carry, "жители рубят деревья и носят брёвна")
+	check(hut != null, "хижина построена жителями (%s)" % w.time_string())
+	check(trees1 < trees0 + 8, "древесина взята из деревьев")
+	check(float(adam.mind.skills["строительство"]) + float(eva.mind.skills["строительство"]) > 1.0, "растёт навык строительства")
+	check(hut != null and int(hut.ext.get("owner", -1)) >= 0, "у хижины есть семья-владелец")
+	var remembered := false
+	for mem in adam.mind.memory + eva.mind.memory:
+		if mem["kind"] == "built":
+			remembered = true
+	check(remembered, "стройка записана в память строителей")
+
+	print("[поселение: основание]")
+	for i in 3 * 1440:
+		w.step(1.0)
+		if w.settlement["name"] != "":
+			break
+	check(w.settlement["name"] != "" and int(w.settlement["level"]) >= 1, "поселение основано: «%s»" % w.settlement["name"])
+	check(Settlement.home_of(w, adam.mind) != null and Settlement.home_of(w, eva.mind) != null, "у каждой семьи есть дом")
+	var slept_home := false
+	for i in 1440:
+		w.step(1.0)
+		var h = Settlement.home_of(w, adam.mind)
+		if adam.mind.sleeping and h != null and int(adam.current_step().get("obj", -1)) == h.obj_id:
+			slept_home = true
+			break
+	check(slept_home, "житель ночует в своём доме")
+
+	print("[поселение: открытия]")
+	adam.mind.skills["строительство"] = 30.0
+	adam.mind.skills["собирательство"] = 30.0
+	Settlement.plan(w)
+	check("storage" in w.settlement["discoveries"] and "well" in w.settlement["discoveries"] and "bush" in w.settlement["discoveries"], "умения открываются по навыкам")
+
+	print("[поселение: амбар]")
+	for ss in Settlement.sites(w):
+		w.remove_object(ss.obj_id, false)
+	var cpos: Vector3 = Settlement.center(w)
+	var store = null
+	for k in 40:
+		var p: Vector3 = cpos + Vector3(cos(k * 0.7), 0, sin(k * 0.7)) * (3.0 + k * 0.3)
+		if w.can_place("storage", p) == "":
+			store = w.add_object("storage", p, {"amount": 0.0, "ext": {"built_by": [adam.mind.id]}})
+			break
+	check(store != null, "амбар поставлен")
+	for r in [adam, eva]:
+		r.mind.know_place(store.obj_id, "storage", store.position, 0.0, w.time_min)
+		r.mind.food = 90.0
+	var stocked := false
+	for i in 1440:
+		w.step(1.0)
+		if store.amount >= 2.0:
+			stocked = true
+			break
+	check(stocked, "сытые жители сами запасают ягоды в амбар (%d)" % int(store.amount))
+	for o in w.objects.values().duplicate():
+		if o.obj_type == "bush":
+			w.remove_object(o.obj_id, false)
+	store.amount = 20.0
+	adam.mind.food = 25.0
+	adam.mind.know_place(store.obj_id, "storage", store.position, 20.0, w.time_min)
+	adam.set_plan([], 0.0)
+	var ate := false
+	for i in 8 * 60:
+		w.step(1.0)
+		if adam.mind.food > 50.0:
+			ate = true
+			break
+	check(ate and store.amount < 20.0, "без кустов житель ест запасы из амбара (осталось %d)" % int(store.amount))
+
+	print("[поселение: сохранение]")
+	adam.mind.carry["wood"] = 2
+	var js := JSON.stringify(w.to_dict())
+	var w2 = _make_world(1)
+	check(w2.load_dict(JSON.parse_string(js)) == "", "сохранение с поселением загружается")
+	check(w2.settlement["name"] == w.settlement["name"] and w2.settlement["discoveries"].size() == w.settlement["discoveries"].size(), "поселение и открытия сохранены")
+	var h2 = Settlement.home_of(w2, w2.resident_by_id(adam.mind.id).mind)
+	check(h2 != null, "владельцы домов сохранены")
+	check(int(w2.resident_by_id(adam.mind.id).mind.carry["wood"]) == 2, "переносимые материалы сохранены")
+	check(w2.get_object(store.obj_id) != null and w2.get_object(store.obj_id).obj_type == "storage", "амбар сохранён")
+	var d: Dictionary = JSON.parse_string(js)
+	d["version"] = 2
+	d.erase("settlement")
+	for od in d["objects"]:
+		if od["type"] == "tree":
+			od["amount"] = 0.0
+	var w3 = _make_world(1)
+	check(w3.load_dict(d) == "", "старое сохранение (v2) загружается")
+	var tree_ok := true
+	for o in w3.objects.values():
+		if o.obj_type == "tree" and o.amount < 1.0:
+			tree_ok = false
+	check(tree_ok, "в старом сохранении у деревьев появляется древесина")
+	w2.queue_free()
+	w3.queue_free()
+	w.queue_free()

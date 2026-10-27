@@ -6,6 +6,7 @@ const Mind = preload("res://scripts/residents/mind.gd")
 const Brain = preload("res://scripts/residents/brain.gd")
 const SaveSystem = preload("res://scripts/core/save_system.gd")
 const Family = preload("res://scripts/residents/family.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 var main      # main.gd
 var world
@@ -126,6 +127,7 @@ func _build() -> void:
 	tr.add_child(trh)
 	trh.add_child(_button("Жители", func(): _toggle_side("people")))
 	trh.add_child(_button("Семьи", func(): _toggle_side("family")))
+	trh.add_child(_button("Посёлок", func(): _toggle_side("settlement")))
 	trh.add_child(_button("Журнал", func(): _toggle_side("log")))
 	trh.add_child(_button("Мир", func(): _toggle_side("world")))
 	trh.add_child(_button("Меню", func(): show_menu(not _menu.visible)))
@@ -564,8 +566,15 @@ func _family_block(m) -> String:
 		t += "[color=#ffd27a]Ждёт ребёнка, роды примерно через %d ч[/color]\n" % int(maxf(0.0, m.pregnancy_due - world.time_min) / 60.0)
 	if m.is_sick(world.time_min):
 		t += "[color=#ff9a8a]Болеет: %s (ещё ~%d ч)[/color]\n" % [m.illness, int((m.sick_until - world.time_min) / 60.0)]
-	if int(m.carry.get("food", 0)) > 0 or int(m.carry.get("water", 0)) > 0:
-		t += "Несёт ребёнку: %s\n" % ("ягоды" if int(m.carry.get("food", 0)) > 0 else "воду")
+	var carried: Array = []
+	for k in [["food", "ягоды"], ["water", "воду"], ["wood", "брёвна"], ["stone", "камни"]]:
+		if int(m.carry.get(k[0], 0)) > 0:
+			carried.append("%s (%d)" % [k[1], int(m.carry[k[0]])])
+	if not carried.is_empty():
+		t += "Несёт: %s\n" % ", ".join(carried)
+	var home = Settlement.home_of(world, m)
+	if m.alive:
+		t += "Дом: %s\n" % ("хижина семьи «%s»" % Settlement.household_label(world, int(home.ext["owner"])) if home != null else "нет своего дома")
 	if m.is_dependent():
 		t += "[color=#9fb3c8]Ещё мал%s: сам%s не добывает еду, о %s заботятся взрослые[/color]\n" % ["" if m.sex == "m" else "а", "" if m.sex == "m" else "а", "нём" if m.sex == "m" else "ней"]
 	if not m.traditions.is_empty():
@@ -680,6 +689,60 @@ func _refresh_side() -> void:
 				for x in trad:
 					t += "%s — %s (соблюдают: %d)\n" % [Family.TRADITIONS[x]["name"], Family.TRADITIONS[x]["desc"], trad[x]]
 			t += "\n[color=#9fb3c8]† — умер. Коснитесь имени, чтобы открыть карточку. 1 год = 2 игровых дня.[/color]"
+		"settlement":
+			var st: Dictionary = world.settlement
+			_side_title.text = "Поселение" + (" «%s»" % st["name"] if st["name"] != "" else "")
+			if st["name"] == "":
+				t += "[color=#9fb3c8]Поселения ещё нет: оно появится, когда жители сами построят три постройки.[/color]\n\n"
+			else:
+				t += "[b]%s[/b], основано: %s\n\n" % [Settlement.level_name(world), world.time_string(float(st["founded_at"]))]
+			var cnt := {}
+			for o in world.objects.values():
+				if not o.ext.get("built_by", []).is_empty():
+					cnt[o.obj_type] = int(cnt.get(o.obj_type, 0)) + 1
+			t += "[b]Построено жителями[/b]: хижин %d · костров %d · амбаров %d · колодцев %d · грядок %d\n" % [
+				int(cnt.get("hut", 0)), int(cnt.get("campfire", 0)), int(cnt.get("storage", 0)), int(cnt.get("well", 0)), int(cnt.get("bush", 0))]
+			t += "Срублено деревьев и разбито камней: %d\n" % int(world.stats.get("felled", 0))
+			var food := 0
+			for o in world.objects.values():
+				if o.obj_type == "storage":
+					food += int(o.amount)
+			if int(cnt.get("storage", 0)) > 0 or food > 0:
+				t += "Ягод в амбарах: %d\n" % food
+			t += "\n[b]Сейчас строят[/b]\n"
+			var ss: Array = Settlement.sites(world)
+			if ss.is_empty():
+				t += "ничего — %s\n" % (st["plan_note"].to_lower() if st["plan_note"] != "" else "план ещё не составлен")
+			for so in ss:
+				var e: Dictionary = so.ext
+				var who: Array = e.get("builders", []).map(func(id): var mm = world.mind_by_id(int(id)); return mm.name if mm != null else "?")
+				t += "• %s%s — дерево %d/%d, камень %d/%d, работа %d%%%s\n" % [Settlement.target_name(e["target"]),
+					(" для семьи «%s»" % Settlement.household_label(world, int(e["owner"]))) if int(e.get("owner", -1)) >= 0 else "",
+					int(e["wood"]), int(e["need_wood"]), int(e["stone"]), int(e["need_stone"]),
+					int(100.0 * float(e["work"]) / maxf(1.0, float(e["work_need"]))), ("; строят: " + ", ".join(who)) if not who.is_empty() else ""]
+			t += "\n[b]Дома семей[/b]\n"
+			var homeless: Array = []
+			for key in Settlement.households(world):
+				var has := false
+				for o in world.objects.values():
+					if o.obj_type == "hut" and int(o.ext.get("owner", -1)) == key:
+						has = true
+				if not has:
+					homeless.append(Settlement.household_label(world, key))
+			t += "Семей: %d · без дома: %s\n" % [Settlement.households(world).size(), ", ".join(homeless) if not homeless.is_empty() else "нет"]
+			t += "\n[b]Умения поселения[/b]\n"
+			for k in Settlement.BUILD:
+				var b: Dictionary = Settlement.BUILD[k]
+				var ok: bool = Settlement.unlocked(world, k)
+				var cond := ""
+				if b.has("unlock"):
+					var bs: Array = Settlement.best_skill(world, b["unlock"][0])
+					cond = " (нужен навык «%s» %d, лучший: %d)" % [b["unlock"][0], int(b["unlock"][1]), int(maxf(0.0, float(bs[1])))]
+				t += "%s — дерево %d, камень %d: %s%s\n" % [Settlement.target_name(k).capitalize(), int(b["wood"]), int(b["stone"]), "[color=#7fd28a]умеют[/color]" if ok else "[color=#e0a060]ещё не умеют[/color]", "" if ok else cond]
+			var bsk: Array = Settlement.best_skill(world, "строительство")
+			if bsk[0] != null:
+				t += "\nЛучший строитель: [url=%d]%s[/url] (%d)\n" % [bsk[0].mind.id, bsk[0].mind.name, int(bsk[1])]
+			t += "\n[color=#9fb3c8]Решения принимают сами жители: что строить, где, кто носит материалы. Ремёсла, торговля и технологии — следующие этапы.[/color]"
 		"world":
 			_side_title.text = "Мир и демография"
 			t += "Seed: %d · %s · год %d\n\n" % [world.seed_value, world.time_string(), world.current_year()]
@@ -705,8 +768,8 @@ func _refresh_side() -> void:
 			t += "\n"
 			for tp in Defs.PLACEABLE:
 				t += "%s: %d\n" % [Defs.display_name(tp), world.count_type(tp)]
-			t += "\n[b]Этап развития:[/b] первобытные семьи\n"
-			t += "[color=#9fb3c8]Есть: пары, рождение, уход за детьми, наследование, взросление, старость, болезни, традиции. Поселения, ремёсла, технологии и космос — следующие этапы, в этой версии их нет.[/color]"
+			t += "\n[b]Этап развития:[/b] %s\n" % ("первобытные семьи" if world.settlement["name"] == "" else Settlement.level_name(world).to_lower() + " «" + world.settlement["name"] + "»")
+			t += "[color=#9fb3c8]Есть: семьи и поколения, строительство поселения жителями (хижины, костёр, амбар, грядки, колодец). Ремёсла, торговля, технологии и космос — следующие этапы, в этой версии их нет.[/color]"
 	_chart.visible = _side_mode == "world"
 	if _chart.visible:
 		_chart.queue_redraw()

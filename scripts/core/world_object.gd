@@ -4,6 +4,7 @@ extends Node3D
 
 const Defs = preload("res://scripts/core/object_defs.gd")
 const M = preload("res://scripts/core/meshes.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 var obj_id: int = 0
 var obj_type: String = ""
@@ -12,6 +13,8 @@ var age_h: float = 0.0
 var variant: float = 0.5  # детерминированный разброс внешнего вида
 var burning: float = 0.0  # для деревьев/кустов, задетых пожаром (часы горения)
 var label: String = ""    # подпись (для могил: имя и годы жизни)
+var ext: Dictionary = {}  # данные построек: стройка, владелец дома, кто строил
+var world = null
 
 var _visual: Node3D
 var _berries: Array = []
@@ -28,13 +31,15 @@ func setup(id: int, t: String, pos: Vector3, data: Dictionary = {}) -> void:
 	age_h = float(data.get("age_h", 0.0))
 	burning = float(data.get("burning", 0.0))
 	label = str(data.get("label", ""))
+	var e = data.get("ext", {})
+	ext = e.duplicate(true) if e is Dictionary else {}
 	rotation.y = float(data.get("rot", variant * TAU))
 	name = "%s_%d" % [t, id]
 	_build()
 
 func to_dict() -> Dictionary:
 	return {"id": obj_id, "type": obj_type, "x": position.x, "y": position.y, "z": position.z,
-		"amount": amount, "age_h": age_h, "variant": variant, "rot": rotation.y, "burning": burning, "label": label}
+		"amount": amount, "age_h": age_h, "variant": variant, "rot": rotation.y, "burning": burning, "label": label, "ext": ext.duplicate(true)}
 
 func display_name() -> String:
 	return Defs.display_name(obj_type)
@@ -49,11 +54,31 @@ func describe() -> String:
 		"spring":
 			s += " — чистая вода"
 		"hut":
-			s += " — укрытие для сна"
+			var ow: int = int(ext.get("owner", -1))
+			if ow >= 0 and world != null:
+				s += " — дом семьи «%s»" % Settlement.household_label(world, ow)
+			else:
+				s += " — свободное укрытие для сна"
+			if not ext.get("built_by", []).is_empty():
+				s += ", построена жителями"
+		"site":
+			var tn: String = Settlement.target_name(ext.get("target", "")) if world != null else ""
+			s += ": %s — дерево %d/%d, камень %d/%d, работа %d%%" % [tn, int(ext.get("wood", 0)), int(ext.get("need_wood", 0)),
+				int(ext.get("stone", 0)), int(ext.get("need_stone", 0)), int(100.0 * float(ext.get("work", 0.0)) / maxf(1.0, float(ext.get("work_need", 1.0))))]
+		"storage":
+			s += " — ягод в запасе: %d из %d" % [int(amount), 60]
+		"well":
+			s += " — вода для поселения"
+		"tree":
+			s += " — древесины: %d" % int(amount)
+		"rock":
+			s += " — камня: %d" % int(amount)
 		"campfire":
 			s += " — тепло и отдых"
 		"grave":
 			s += ": " + label
+	if obj_type == "bush" and ext.get("planted", false):
+		s += " (посажен жителями)"
 	if burning > 0.0:
 		s += " (горит)"
 	return s
@@ -76,6 +101,8 @@ func take_food(n: int) -> int:
 	var got := mini(n, int(amount))
 	amount -= got
 	_update_berries()
+	if obj_type == "storage" and got > 0 and int(amount) % 10 == 9:
+		refresh_visual()
 	return got
 
 func ignite() -> void:
@@ -99,11 +126,61 @@ func _process(delta: float) -> void:
 
 # ---------------------------------------------------------------- визуал
 
+func refresh_visual() -> void:
+	if _visual:
+		_visual.queue_free()
+		remove_child(_visual)
+	_berries.clear()
+	_flames.clear()
+	_build_visual()
+
 func _build() -> void:
+	_build_visual()
+	_build_pick()
+
+func _build_visual() -> void:
 	_visual = Node3D.new()
 	add_child(_visual)
 	var v := variant
 	match obj_type:
+		"site":
+			var tg: String = ext.get("target", "hut")
+			var sz: float = {"hut": 2.2, "storage": 2.0, "well": 1.4, "campfire": 1.0, "bush": 0.9}.get(tg, 1.5)
+			M.add(_visual, M.box(Vector3(sz + 0.3, 0.06, sz + 0.3)), M.mat(Color(0.5, 0.4, 0.28)), Vector3(0, 0.03, 0))
+			var prog: float = clampf(float(ext.get("work", 0.0)) / maxf(1.0, float(ext.get("work_need", 1.0))), 0.0, 1.0)
+			var h: float = 0.25 + prog * 1.3
+			if tg in ["hut", "storage"]:
+				for cx in [-1, 1]:
+					for cz in [-1, 1]:
+						M.add(_visual, M.cyl(0.07, 0.08, h, 6), M.mat(Color(0.45, 0.3, 0.17)), Vector3(cx * sz / 2.0, h / 2.0, cz * sz / 2.0))
+				if prog > 0.5:
+					M.add(_visual, M.box(Vector3(sz, 0.5 * (prog - 0.5) * 2.0, 0.08)), M.mat(Color(0.55, 0.4, 0.25)), Vector3(0, 0.3, -sz / 2.0))
+			elif tg == "well":
+				M.add(_visual, M.cyl(0.6, 0.65, 0.2 + prog * 0.5, 12), M.mat(Color(0.5, 0.5, 0.52)), Vector3(0, 0.1 + prog * 0.25, 0))
+			# сложенные материалы
+			for i in int(ext.get("wood", 0)):
+				M.add(_visual, M.cyl(0.07, 0.07, 0.9, 6), M.mat(Color(0.48, 0.32, 0.18)), Vector3(sz / 2.0 + 0.5, 0.08 + (i / 3) * 0.14, -0.3 + (i % 3) * 0.16), Vector3.ONE, Vector3(PI / 2, 0, 0))
+			for i in int(ext.get("stone", 0)):
+				M.add(_visual, M.sphere(0.13, 0.2, 6), M.mat(Color(0.48, 0.47, 0.46)), Vector3(-sz / 2.0 - 0.5 + (i % 3) * 0.2, 0.08 + (i / 3) * 0.15, 0.2))
+			# колышек с флажком — видно, что это стройка
+			M.add(_visual, M.cyl(0.03, 0.03, 1.4, 5), M.mat(Color(0.4, 0.3, 0.2)), Vector3(-sz / 2.0, 0.7, -sz / 2.0))
+			M.add(_visual, M.box(Vector3(0.35, 0.22, 0.02)), M.mat(Color(0.9, 0.75, 0.2)), Vector3(-sz / 2.0 + 0.18, 1.28, -sz / 2.0))
+		"storage":
+			for cx in [-1, 1]:
+				for cz in [-1, 1]:
+					M.add(_visual, M.cyl(0.08, 0.1, 0.5, 6), M.mat(Color(0.4, 0.28, 0.16)), Vector3(cx * 0.8, 0.25, cz * 0.8))
+			M.add(_visual, M.box(Vector3(2.0, 1.1, 2.0)), M.mat(Color(0.62, 0.46, 0.28)), Vector3(0, 1.05, 0))
+			M.add(_visual, M.prism(Vector3(2.4, 0.9, 2.3)), M.mat(Color(0.45, 0.32, 0.2)), Vector3(0, 2.05, 0))
+			var baskets: int = mini(6, int(ceil(amount / 10.0)))
+			for i in baskets:
+				M.add(_visual, M.cyl(0.18, 0.14, 0.25, 8), M.mat(Color(0.7, 0.55, 0.3)), Vector3(-0.75 + i * 0.3, 0.12, 1.25))
+				M.add(_visual, M.sphere(0.14, 0.12, 6), M.mat(Color(0.8, 0.12, 0.2)), Vector3(-0.75 + i * 0.3, 0.26, 1.25))
+		"well":
+			M.add(_visual, M.cyl(0.7, 0.75, 0.6, 14), M.mat(Color(0.5, 0.5, 0.52)), Vector3(0, 0.3, 0))
+			M.add(_visual, M.cyl(0.55, 0.55, 0.02, 14), M.mat(Color(0.25, 0.55, 0.85)), Vector3(0, 0.55, 0))
+			for sx in [-1, 1]:
+				M.add(_visual, M.cyl(0.05, 0.05, 1.5, 6), M.mat(Color(0.42, 0.28, 0.16)), Vector3(sx * 0.75, 1.0, 0))
+			M.add(_visual, M.prism(Vector3(1.8, 0.45, 1.0)), M.mat(Color(0.5, 0.35, 0.2)), Vector3(0, 1.85, 0))
 		"tree":
 			var s := 0.8 + v * 0.6
 			_visual.scale = Vector3.ONE * s
@@ -153,6 +230,10 @@ func _build() -> void:
 				var a := i * TAU / 5.0 + v
 				_add_flames(1, 0.8 + 0.5 * ((i * 37) % 10) / 10.0, Vector3(cos(a), 0, sin(a)) * 0.9)
 			_add_flames(1, 1.4)
+	if burning > 0.0:
+		_add_flames(3, 0.8)
+
+func _build_pick() -> void:
 	# Зона выбора касанием
 	var area := Area3D.new()
 	area.collision_layer = 2
@@ -160,14 +241,12 @@ func _build() -> void:
 	area.set_meta("pick", self)
 	var cs := CollisionShape3D.new()
 	var shape := CylinderShape3D.new()
-	shape.radius = 1.0 if obj_type != "hut" else 1.4
-	shape.height = 3.0 if obj_type in ["tree", "hut"] else 1.4
+	shape.radius = 1.4 if obj_type in ["hut", "storage", "site"] else 1.0
+	shape.height = 3.0 if obj_type in ["tree", "hut", "storage"] else 1.4
 	cs.shape = shape
 	cs.position.y = shape.height / 2.0
 	area.add_child(cs)
 	add_child(area)
-	if burning > 0.0:
-		_add_flames(3, 0.8)
 
 func _add_flames(n: int, size: float, offset: Vector3 = Vector3.ZERO) -> void:
 	for i in n:

@@ -4,6 +4,7 @@ extends RefCounted
 
 const Defs = preload("res://scripts/core/object_defs.gd")
 const Family = preload("res://scripts/residents/family.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 const PERCEPTION := 11.0
 
@@ -88,13 +89,13 @@ static func perceive(r) -> void:
 				m.remember(w.time_min, "danger", r.g("Увидел", "Увидела") + " огонь — опасное место", 0.8)
 				w.log_event("%s замечает пожар и запоминает опасное место" % m.name)
 			m.add_danger(o.position, 5.0 + 3.0 * m.traits["caution"], until)
-		if o.obj_type in ["bush", "spring", "hut", "campfire"]:
+		if o.obj_type in ["bush", "spring", "hut", "campfire", "storage", "well"]:
 			var is_new: bool = m.know_place(o.obj_id, o.obj_type, o.position, o.amount, w.time_min)
 			if is_new:
 				m.add_skill("исследование", 1.5)
 				if o.obj_type != "bush" or m.places_of("bush").size() <= 3:
 					m.remember(w.time_min, "discover", r.g("Нашёл", "Нашла") + ": " + Defs.display_name(o.obj_type).to_lower(), 0.45 if o.obj_type == "bush" else 0.6)
-				if o.obj_type in ["spring", "hut"]:
+				if o.obj_type in ["spring"] or (o.obj_type == "hut" and o.ext.get("built_by", []).is_empty()):
 					w.log_event("%s находит %s" % [m.name, "родник" if o.obj_type == "spring" else "хижину"])
 	# известные места в поле зрения, которых больше нет
 	for key in m.known_places.keys():
@@ -158,6 +159,22 @@ static func evaluate(r) -> Array:
 			out.append({"goal": "rest", "u": (55.0 - m.mood) / 55.0 * 0.8 + 0.1, "reason": "Плохое настроение — отдохнуть у костра"})
 		elif "evening_fire" in m.traditions and w.hour_f() >= 18.0 and w.hour_f() < 21.0:
 			out.append({"goal": "rest", "u": 0.5, "reason": "Традиция рода — вечер у костра"})
+	# стройка и запасы — общее дело поселения
+	if m.age_years >= 14.0 and not m.is_sick(w.time_min):
+		var dil: float = float(m.traits.get("diligence", 0.5))
+		var work_mul: float = 0.25 if w.is_night() else 1.0
+		if m.pregnant or m.stage() == "elder": work_mul *= 0.6
+		var site = Settlement.pick_site(r)
+		if site != null:
+			var own: bool = int(site.ext.get("owner", -1)) == Settlement.household_of(w, m)
+			out.append({"goal": "build", "u": (0.3 + dil * 0.3 + (0.15 if own else 0.0)) * work_mul, "target": site.obj_id,
+				"reason": ("Строим свой дом" if own else "Поселению нужен %s" % Settlement.target_name(site.ext.get("target", "")).replace("хижину", "дом").replace("грядку", "огород"))})
+		var stores: Array = m.places_of("storage")
+		if not stores.is_empty() and m.food > 55.0:
+			var stv: Dictionary = stores[0]
+			var so = w.get_object(int(stv["id"]))
+			if so != null and so.amount < minf(Settlement.STORAGE_CAP, w.alive_count() * 4.0):
+				out.append({"goal": "stock", "u": (0.22 + dil * 0.25) * work_mul, "target": so.obj_id, "reason": "Запасти еду в амбар"})
 	# забота о детях
 	var kids: Array = Family.care_targets(r)
 	if not kids.is_empty():
@@ -263,7 +280,7 @@ static func goal_name(g: String) -> String:
 	return {"flee": "спастись от огня", "drink": "попить", "eat": "поесть", "sleep": "поспать",
 		"socialize": "пообщаться", "rest": "отдохнуть у костра", "explore": "исследовать",
 		"idle": "осмотреться", "talk": "разговор", "care": "позаботиться о ребёнке", "follow": "держаться рядом",
-		"play": "поиграть"}.get(g, g)
+		"play": "поиграть", "build": "строить", "stock": "запасти еду"}.get(g, g)
 
 ## Построить план для цели. Пустой план — цель сейчас недостижима.
 static func build_plan(r, c: Dictionary) -> Array:
@@ -304,6 +321,28 @@ static func build_plan(r, c: Dictionary) -> Array:
 			return plan
 		"follow":
 			return [{"a": "go", "rid": c.get("target", -1), "near": 2.0}, {"a": "look", "dur": 15.0}]
+		"build":
+			var site = w.get_object(int(c.get("target", -1)))
+			if site == null:
+				return []
+			return Settlement.plan_for(r, site)
+		"stock":
+			var so = w.get_object(int(c.get("target", -1)))
+			if so == null:
+				return []
+			var bushes: Array = m.places_of("bush").filter(func(p): return p["type"] == "bush" and float(p["amount"]) >= 2.0 and not r.unreachable.has(int(p["id"])))
+			if bushes.is_empty():
+				return []
+			var pos: Vector3 = r.sim_pos
+			bushes.sort_custom(func(a, b): return Vector2(a["x"] - pos.x, a["z"] - pos.z).length() < Vector2(b["x"] - pos.x, b["z"] - pos.z).length())
+			var bp: Dictionary = bushes[0]
+			var plan2: Array = []
+			if int(m.carry.get("food", 0)) <= 0:
+				plan2.append({"a": "go", "x": bp["x"], "z": bp["z"], "obj": bp["id"], "near": 1.6})
+				plan2.append({"a": "gather", "obj": bp["id"], "need": "food"})
+			plan2.append({"a": "go", "x": so.position.x, "z": so.position.z, "obj": so.obj_id, "near": 2.0, "quiet": true})
+			plan2.append({"a": "deposit", "obj": so.obj_id})
+			return plan2
 		"play":
 			var cg = w.resident_by_id(int(c.get("target", -1)))
 			if cg == null:
@@ -331,6 +370,14 @@ static func build_plan(r, c: Dictionary) -> Array:
 						var hh: Dictionary = huts[i]
 						huts.remove_at(i)
 						huts.push_front(hh)
+						break
+			var home = Settlement.home_of(w, m)
+			if home != null and (pr == null or not pr.mind.sleeping):
+				for i in huts.size():
+					if int(huts[i]["id"]) == home.obj_id:
+						var hm: Dictionary = huts[i]
+						huts.remove_at(i)
+						huts.push_front(hm)
 						break
 			if not huts.is_empty():
 				var h: Dictionary = huts[0]

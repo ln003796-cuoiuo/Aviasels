@@ -3,6 +3,7 @@ extends RefCounted
 ## взросление, старение, болезни, традиции рода. Работает поверх общего состояния мира.
 
 const Mind = preload("res://scripts/residents/mind.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 const MAX_POP := 30               # предел одновременно живущих (производительность телефона)
 const PREGNANCY_YEARS := 0.75
@@ -154,6 +155,8 @@ static func hourly(w, h: float) -> void:
 		var crowd: float = clampf(1.0 - float(alive) / MAX_POP, 0.0, 1.0)
 		var food_supply: float = clampf(float(w.count_type("bush")) * 3.0 / maxf(1.0, alive * 6.0), 0.15, 1.0)
 		var together: float = 1.6 if (m.sleeping and p.mind.sleeping) else 1.0
+		if Settlement.home_of(w, m) == null:
+			together *= 0.6   # без своего дома детей заводят реже
 		if r.rng.randf() < CONCEPTION_PER_H * h * fert * crowd * food_supply * together:
 			m.pregnant = true
 			m.pregnancy_father = p.mind.id
@@ -301,7 +304,7 @@ static func maybe_newcomer(w, rng: RandomNumberGenerator, force: bool = false):
 		"family_name": nm, "generation": 1, "born_at": w.time_min - age * Mind.YEAR_MIN,
 		"lifespan": 52.0 + vit * 28.0 + rng.randf_range(-4.0, 4.0),
 		"traits": {"curiosity": rng.randf_range(0.2, 0.9), "caution": rng.randf_range(0.2, 0.9),
-			"sociability": rng.randf_range(0.3, 0.95), "calm": rng.randf_range(0.25, 0.9), "vitality": vit},
+			"sociability": rng.randf_range(0.3, 0.95), "calm": rng.randf_range(0.25, 0.9), "vitality": vit, "diligence": rng.randf_range(0.3, 0.9)},
 		"appearance": {"skin": skins[rng.randi() % 5], "hair": hairs[rng.randi() % 5],
 			"shirt": Color.from_hsv(rng.randf(), 0.5, 0.75).to_html(false),
 			"pants": Color.from_hsv(rng.randf(), 0.35, 0.4).to_html(false),

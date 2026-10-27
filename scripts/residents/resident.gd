@@ -7,6 +7,7 @@ const CharacterModel = preload("res://scripts/residents/character_model.gd")
 const M = preload("res://scripts/core/meshes.gd")
 const Defs = preload("res://scripts/core/object_defs.gd")
 const Family = preload("res://scripts/residents/family.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
 const WALK_SPEED := 0.5   # единиц мира за игровую минуту
 const RUN_SPEED := 0.95
@@ -184,6 +185,14 @@ func _execute(dt: float) -> void:
 			_do_gather(step, dt)
 		"feed":
 			_do_feed(step)
+		"chop":
+			_do_chop(step, dt)
+		"deliver":
+			_do_deliver(step)
+		"build":
+			_do_build(step, dt)
+		"deposit":
+			_do_deposit(step)
 		_:
 			_advance()
 
@@ -222,6 +231,9 @@ func _do_go(step: Dictionary, dt: float) -> void:
 	var target = _target_of(step)
 	if target == null:
 		_fail("цель недоступна")
+		return
+	if step.has("obj") and step.get("quiet", false) and world.get_object(int(step["obj"])) == null:
+		_fail("цель уже не нужна")   # дерево срубили или стройку закончили другие
 		return
 	if step.has("obj") and world.get_object(int(step["obj"])) == null and _flat_dist(target) < 9.0:
 		_fail_place(int(step["obj"]), mind.known_places.get(str(step["obj"]), {}).get("type", "bush"))
@@ -321,6 +333,85 @@ func _do_feed(step: Dictionary) -> void:
 	c.mind.remember(world.time_min, "cared", "%s %s меня" % [(who.capitalize() + " " if who != "" else "") + mind.name, ("накормил" if need == "food" else "напоил") + g("", "а")], 0.3)
 	say("Держи, %s." % c.mind.name if need == "food" else "Попей, %s." % c.mind.name)
 	world.stats["feedings"] = int(world.stats.get("feedings", 0)) + 1
+	_advance()
+
+## Срубить дерево / наколоть камня.
+func _do_chop(step: Dictionary, dt: float) -> void:
+	var o = world.get_object(int(step["obj"]))
+	if o == null or o.amount < 1.0:
+		_fail("материала нет")
+		return
+	_face(o.position)
+	_step_t += dt
+	var sk: float = float(mind.skills.get("строительство", 0.0))
+	if _step_t < 30.0 / (1.0 + sk / 40.0):
+		return
+	var mat: String = step["mat"]
+	var got: int = mini(2, int(o.amount))
+	o.amount -= got
+	mind.carry[mat] = int(mind.carry.get(mat, 0)) + got
+	mind.add_skill("строительство", 0.25)
+	if o.amount < 1.0:
+		var what := "дерево" if o.obj_type == "tree" else "камень"
+		world.remove_object(o.obj_id, false)
+		world.stats["felled"] = int(world.stats.get("felled", 0)) + 1
+		if int(world.stats["felled"]) <= 3 or int(world.stats["felled"]) % 10 == 0:
+			world.log_event("%s %s %s (всего: %d)" % [mind.name, g("срубил", "срубила") if what == "дерево" else g("разбил", "разбила"), what, int(world.stats["felled"])])
+	_advance()
+
+## Сложить принесённый материал на стройке.
+func _do_deliver(step: Dictionary) -> void:
+	var s = world.get_object(int(step["obj"]))
+	var mat: String = step["mat"]
+	if s == null or s.obj_type != "site":
+		_fail("стройки нет")
+		return
+	var n: int = mini(int(mind.carry.get(mat, 0)), Settlement.remaining(s, mat))
+	s.ext[mat] = int(s.ext.get(mat, 0)) + n
+	mind.carry[mat] = int(mind.carry.get(mat, 0)) - n
+	mind.add_skill("строительство", 0.1)
+	if not mind.id in s.ext["builders"]:
+		s.ext["builders"].append(mind.id)
+	s.refresh_visual()
+	_advance()
+
+## Работа на стройке: когда материалы собраны, постройка растёт.
+func _do_build(step: Dictionary, dt: float) -> void:
+	var s = world.get_object(int(step["obj"]))
+	if s == null or s.obj_type != "site":
+		_fail("стройки нет")
+		return
+	if Settlement.remaining(s, "wood") > 0 or Settlement.remaining(s, "stone") > 0:
+		_fail("не хватает материалов")
+		return
+	_face(s.position)
+	_step_t += dt
+	if _step_t < float(step["dur"]):
+		return
+	var sk: float = float(mind.skills.get("строительство", 0.0))
+	s.ext["work"] = float(s.ext.get("work", 0.0)) + float(step["dur"]) * (1.0 + sk / 50.0)
+	mind.add_skill("строительство", 0.5)
+	mind.energy = maxf(0.0, mind.energy - 3.0)
+	if not mind.id in s.ext["builders"]:
+		s.ext["builders"].append(mind.id)
+	if float(s.ext["work"]) >= float(s.ext["work_need"]):
+		Settlement.complete(world, s)
+	else:
+		s.refresh_visual()
+	_advance()
+
+## Сложить ягоды в амбар.
+func _do_deposit(step: Dictionary) -> void:
+	var o = world.get_object(int(step["obj"]))
+	if o == null or o.obj_type != "storage":
+		_fail("амбара нет")
+		return
+	var n: int = mini(int(mind.carry.get("food", 0)), Settlement.STORAGE_CAP - int(o.amount))
+	o.amount += n
+	mind.carry["food"] = int(mind.carry.get("food", 0)) - n
+	mind.know_place(o.obj_id, "storage", o.position, o.amount, world.time_min)
+	mind.add_skill("собирательство", 0.3)
+	o.refresh_visual()
 	_advance()
 
 func _flat_dist(p: Vector3) -> float:
@@ -566,9 +657,21 @@ func _update_action_text() -> void:
 				else:
 					mind.action_text = "Идёт к " + (o.mind.name if o else "собеседнику")
 			elif step.get("explore", false): mind.action_text = "Исследует местность"
+			elif mind.goal == "build":
+				if mind.plan.size() > 1 and mind.plan[1].get("a", "") == "chop":
+					mind.action_text = "Идёт рубить дерево" if mind.plan[1]["mat"] == "wood" else "Идёт за камнем"
+				elif int(mind.carry.get("wood", 0)) > 0 or int(mind.carry.get("stone", 0)) > 0:
+					mind.action_text = "Несёт " + ("брёвна" if int(mind.carry.get("wood", 0)) > 0 else "камни") + " на стройку"
+				else:
+					mind.action_text = "Идёт на стройку"
+			elif mind.goal == "stock" and int(mind.carry.get("food", 0)) > 0: mind.action_text = "Несёт ягоды в амбар"
 			else: mind.action_text = "Идёт: " + Brain.goal_name(mind.goal)
-		"eat": mind.action_text = "Ест ягоды"
-		"drink": mind.action_text = "Пьёт воду"
+		"eat":
+			var eo = world.get_object(int(step.get("obj", -1)))
+			mind.action_text = "Ест запасы из амбара" if eo != null and eo.obj_type == "storage" else "Ест ягоды"
+		"drink":
+			var dw = world.get_object(int(step.get("obj", -1)))
+			mind.action_text = "Пьёт из колодца" if dw != null and dw.obj_type == "well" else "Пьёт воду"
 		"sleep": mind.action_text = "Спит" + (" в хижине" if int(step.get("obj", -1)) >= 0 else " на земле")
 		"talk":
 			var o2 = world.resident_by_id(int(step["rid"]))
@@ -576,7 +679,13 @@ func _update_action_text() -> void:
 		"talk_request": mind.action_text = "Заговаривает"
 		"rest": mind.action_text = "Греется у костра"
 		"look": mind.action_text = "Осматривается" if mind.goal != "follow" else "Держится рядом с родными"
-		"gather": mind.action_text = "Собирает " + ("ягоды" if step["need"] == "food" else "воду") + " для ребёнка"
+		"gather": mind.action_text = "Собирает " + ("ягоды" if step["need"] == "food" else "воду") + (" в амбар" if mind.goal == "stock" else " для ребёнка")
+		"chop": mind.action_text = "Рубит дерево" if step["mat"] == "wood" else "Добывает камень"
+		"deliver": mind.action_text = "Складывает " + ("брёвна" if step["mat"] == "wood" else "камни") + " на стройке"
+		"build":
+			var so = world.get_object(int(step["obj"]))
+			mind.action_text = "Строит " + (Settlement.target_name(so.ext.get("target", "")) if so else "")
+		"deposit": mind.action_text = "Складывает ягоды в амбар"
 		"feed": mind.action_text = "Кормит ребёнка" if step["need"] == "food" else "Поит ребёнка"
 		_: mind.action_text = "Думает"
 
@@ -673,6 +782,13 @@ func _process(delta: float) -> void:
 			"drink": st = "drink"
 			"talk": st = "talk"
 			"rest": st = "rest"
+			"chop", "build": st = "work"
+	var ck := ""
+	if mind.alive and not mind.sleeping:
+		if int(mind.carry.get("wood", 0)) > 0: ck = "wood"
+		elif int(mind.carry.get("stone", 0)) > 0: ck = "stone"
+		elif int(mind.carry.get("food", 0)) > 0: ck = "food"
+	model.set_carry(ck)
 	var sp: float = 1.0 if world.speed == 0 else clampf(float(world.speed), 1.0, 3.0)
 	model.animate(delta * (0.0 if world.speed == 0 else 1.0), st, sp)
 	if _bubble_time > 0.0:

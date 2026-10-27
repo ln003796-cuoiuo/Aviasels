@@ -101,6 +101,10 @@ func animate(delta: float, state: String, speed: float) -> void:
 				arm_l_target = -0.2 + sin(_t * 2.3 + 1.0) * 0.2
 				_head.rotation.y = sin(_t * 1.7) * 0.2
 				_head.rotation.x = sin(_t * 4.0) * 0.06
+			"work":
+				arm_target = -2.3 + absf(sin(_t * 6.0)) * 1.8
+				arm_l_target = arm_target
+				_head.rotation.x = 0.2
 			"rest":
 				_leg_l.rotation.x = lerpf(_leg_l.rotation.x, -1.4, k)
 				_leg_r.rotation.x = lerpf(_leg_r.rotation.x, -1.4, k)
@@ -110,6 +114,32 @@ func animate(delta: float, state: String, speed: float) -> void:
 				_head.rotation.x = 0.0
 		_arm_r.rotation.x = lerpf(_arm_r.rotation.x, arm_target, k)
 		_arm_l.rotation.x = lerpf(_arm_l.rotation.x, arm_l_target, k)
+
+var _carry_node: Node3D
+var _carry_kind := ""
+
+## Показать, что житель несёт: брёвна, камни или ягоды.
+func set_carry(kind: String) -> void:
+	if kind == _carry_kind:
+		return
+	_carry_kind = kind
+	if _carry_node:
+		_carry_node.queue_free()
+		_carry_node = null
+	if kind == "":
+		return
+	_carry_node = Node3D.new()
+	_body.add_child(_carry_node)
+	_carry_node.position = Vector3(0, 1.0, 0.32)
+	match kind:
+		"wood":
+			for i in 2:
+				M.add(_carry_node, M.cyl(0.06, 0.06, 0.8, 6), M.mat(Color(0.48, 0.32, 0.18)), Vector3(0, i * 0.12, 0), Vector3.ONE, Vector3(0, 0, PI / 2))
+		"stone":
+			M.add(_carry_node, M.sphere(0.15, 0.24, 6), M.mat(Color(0.5, 0.49, 0.48)))
+		"food":
+			M.add(_carry_node, M.cyl(0.14, 0.11, 0.18, 8), M.mat(Color(0.7, 0.55, 0.3)))
+			M.add(_carry_node, M.sphere(0.1, 0.1, 6), M.mat(Color(0.8, 0.12, 0.2)), Vector3(0, 0.08, 0))
 
 func set_dead_look() -> void:
 	for p in _parts:

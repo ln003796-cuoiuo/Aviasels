@@ -25,11 +25,11 @@ var health: float = 100.0
 var mood: float = 70.0
 
 # Черты характера 0..1
-var traits := {"curiosity": 0.5, "caution": 0.5, "sociability": 0.5, "calm": 0.5, "vitality": 0.5}
+var traits := {"curiosity": 0.5, "caution": 0.5, "sociability": 0.5, "calm": 0.5, "vitality": 0.5, "diligence": 0.5}
 var preferences := {}            # например {"favorite_place": "spring"}
 var long_goal: String = ""
 
-var skills := {"собирательство": 0.0, "общение": 0.0, "исследование": 0.0, "выживание": 0.0, "забота": 0.0}
+var skills := {"собирательство": 0.0, "общение": 0.0, "исследование": 0.0, "выживание": 0.0, "забота": 0.0, "строительство": 0.0}
 
 var memory: Array = []           # [{t, kind, text, imp}]
 var known_places := {}           # obj_id(str) -> {type, x, z, amount, seen}
@@ -49,7 +49,7 @@ var pregnant: bool = false
 var pregnancy_due: float = 0.0
 var pregnancy_father: int = -1
 var last_birth: float = -1.0e9
-var carry := {"food": 0, "water": 0}  # что несёт для ребёнка
+var carry := {"food": 0, "water": 0, "wood": 0, "stone": 0}  # что несёт: еду ребёнку, материалы на стройку
 var sick_until: float = 0.0
 var illness: String = ""
 var traditions: Array = []        # культурные привычки рода
@@ -102,7 +102,7 @@ func places_of(t: String) -> Array:
 	var out: Array = []
 	for k in known_places:
 		var p: Dictionary = known_places[k]
-		if p["type"] == t:
+		if p["type"] == t or (t == "bush" and p["type"] == "storage") or (t == "spring" and p["type"] == "well"):
 			var e := p.duplicate()
 			e["id"] = int(k)
 			out.append(e)
@@ -186,6 +186,8 @@ func trait_text() -> String:
 	if traits["calm"] < 0.35: parts.append("вспыльчивый" if sex == "m" else "вспыльчивая")
 	if float(traits.get("vitality", 0.5)) > 0.7: parts.append("крепкий" if sex == "m" else "крепкая")
 	if float(traits.get("vitality", 0.5)) < 0.3: parts.append("хрупкий" if sex == "m" else "хрупкая")
+	if float(traits.get("diligence", 0.5)) > 0.7: parts.append("трудолюбивый" if sex == "m" else "трудолюбивая")
+	if float(traits.get("diligence", 0.5)) < 0.3: parts.append("ленивый" if sex == "m" else "ленивая")
 	if parts.is_empty():
 		parts.append("уравновешенный" if sex == "m" else "уравновешенная")
 	return ", ".join(parts)
@@ -221,8 +223,10 @@ func from_dict(d: Dictionary) -> void:
 	plan = []
 	if not traits.has("vitality"):
 		traits["vitality"] = 0.5
+	if not traits.has("diligence"):
+		traits["diligence"] = 0.5
 	var ints: Array = []
 	for c in children:
 		ints.append(int(c))
 	children = ints
-	carry = {"food": int(carry.get("food", 0)), "water": int(carry.get("water", 0))}
+	carry = {"food": int(carry.get("food", 0)), "water": int(carry.get("water", 0)), "wood": int(carry.get("wood", 0)), "stone": int(carry.get("stone", 0))}

@@ -12,8 +12,10 @@ const Resident = preload("res://scripts/residents/resident.gd")
 const Defs = preload("res://scripts/core/object_defs.gd")
 const Mind = preload("res://scripts/residents/mind.gd")
 const Family = preload("res://scripts/residents/family.gd")
+const Settlement = preload("res://scripts/core/settlement.gd")
 
-const SAVE_VERSION := 2
+const SAVE_VERSION := 3
+const MAX_TREES := 110
 const MAX_BUSHES := 45
 const BODY_REMOVE_H := 12.0
 const MIN_PER_REAL_SEC := 6.0   # при скорости x1: 1 игровой час = 10 секунд
@@ -37,6 +39,8 @@ var stats := {"births": 0, "deaths": 0, "couples": 0, "feedings": 0, "deaths_by"
 var pop_history: Array = []  # [{d, pop, births, deaths}]
 var archive: Array = []      # Mind умерших, чьи тела уже убраны (для родословной)
 var _last_day: int = 1
+var settlement: Dictionary = Settlement.fresh()
+var _plan_acc := 0.0
 var _rng := RandomNumberGenerator.new()
 const BUCKET := 8.0
 var _buckets := {}         # Vector2i -> Array объектов (пространственный индекс)
@@ -105,6 +109,10 @@ func step(dt: float) -> void:
 		_sim_objects(h)
 		Family.hourly(self, h)
 		_remove_bodies()
+		_plan_acc += h
+		if _plan_acc >= 2.0:
+			_plan_acc = 0.0
+			Settlement.plan(self)
 	if day() != _last_day:
 		_last_day = day()
 		_daily()
@@ -116,6 +124,8 @@ func _daily() -> void:
 		if r.mind.alive:
 			Family.daily(self, r)
 	_spread_bushes()
+	_regrow_forest()
+	Settlement.daily(self)
 	Family.maybe_newcomer(self, _rng)
 	pop_history.append({"d": day(), "pop": alive_count(), "births": int(stats["births"]), "deaths": int(stats["deaths"])})
 	if pop_history.size() > 400:
@@ -142,6 +152,28 @@ func _spread_bushes() -> void:
 			break
 	if added > 0:
 		log_event("Ягодники разрослись: новых кустов %d" % added)
+
+## Лес понемногу восстанавливается рядом с живыми деревьями.
+func _regrow_forest() -> void:
+	var trees: Array = objects.values().filter(func(o): return o.obj_type == "tree" and o.burning <= 0.0)
+	var n := trees.size()
+	if n == 0:
+		return
+	var cpos := Settlement.center(self)
+	for t in trees:
+		if n >= MAX_TREES:
+			break
+		if randf() > 0.03:
+			continue
+		var a := randf() * TAU
+		var p: Vector3 = t.position + Vector3(cos(a), 0, sin(a)) * randf_range(2.0, 6.0)
+		if settlement["has_center"] and p.distance_to(cpos) < 12.0:
+			continue   # в самом поселении лес не растёт
+		var hgt: float = terrain.height_at(p.x, p.z)
+		if hgt < 0.5 or hgt > 6.0 or can_place("tree", p) != "":
+			continue
+		add_object("tree", p, {"variant": randf(), "rot": randf() * TAU})
+		n += 1
 
 ## Тела умерших через полдня заменяются могилой; данные остаются в родословной.
 func _remove_bodies() -> void:
@@ -284,7 +316,7 @@ func trace(text: String) -> void:
 # ---------------------------------------------------------------- объекты
 
 func _obstacle_radius(t: String) -> int:
-	return 1 if t in ["hut", "fire"] else 0
+	return 1 if t in ["hut", "fire", "storage"] else 0
 
 ## Проверка, можно ли поставить объект. Пустая строка — можно.
 func can_place(t: String, pos: Vector3) -> String:
@@ -293,11 +325,11 @@ func can_place(t: String, pos: Vector3) -> String:
 	var h: float = terrain.height_at(pos.x, pos.z)
 	if h < 0.2 and t != "spring":
 		return "Здесь вода"
-	var min_d := 1.3 if t not in ["hut"] else 2.4
+	var min_d := 1.3 if t not in ["hut", "storage"] else 2.4
 	for o in objects_near(pos, 3.0):
 		if Vector2(o.position.x - pos.x, o.position.z - pos.z).length() < min_d:
 			return "Слишком близко к другому объекту"
-	if t == "hut":
+	if t in ["hut", "storage", "well"]:
 		var c: Vector2i = nav.world_to_cell(pos)
 		if terrain.cell_slope(c.x, c.y) > 0.9:
 			return "Слишком крутой склон для хижины"
@@ -311,6 +343,7 @@ func add_object(t: String, pos: Vector3, data: Dictionary = {}) -> Node3D:
 		pos.y = maxf(pos.y, 0.02)
 	var o = WorldObject.new()
 	_objects_node.add_child(o)
+	o.world = self
 	o.setup(id, t, pos, data)
 	objects[id] = o
 	var bk := _bkey(pos.x, pos.z)
@@ -430,6 +463,8 @@ func clear_world() -> void:
 	pop_history.clear()
 	stats = {"births": 0, "deaths": 0, "couples": 0, "feedings": 0, "deaths_by": {}}
 	next_resident_id = 1002
+	settlement = Settlement.fresh()
+	_plan_acc = 0.0
 	events.clear()
 	trace_log.clear()
 	undo_stack.clear()
@@ -478,7 +513,7 @@ func _populate(s: int) -> void:
 			"food": rng.randf_range(55.0, 75.0), "water": rng.randf_range(50.0, 70.0), "energy": rng.randf_range(70.0, 90.0),
 			"social": rng.randf_range(35.0, 55.0), "mood": 65.0, "health": 100.0,
 			"traits": {"curiosity": rng.randf_range(0.2, 0.9), "caution": rng.randf_range(0.2, 0.9),
-				"sociability": rng.randf_range(0.3, 0.95), "calm": rng.randf_range(0.25, 0.9), "vitality": vit},
+				"sociability": rng.randf_range(0.3, 0.95), "calm": rng.randf_range(0.25, 0.9), "vitality": vit, "diligence": rng.randf_range(0.3, 0.9)},
 			"appearance": {"skin": skins[rng.randi() % 5], "hair": hairs[rng.randi() % 5],
 				"shirt": Color.from_hsv(rng.randf(), 0.5, 0.75).to_html(false),
 				"pants": Color.from_hsv(rng.randf(), 0.35, 0.4).to_html(false),
@@ -538,7 +573,8 @@ func to_dict() -> Dictionary:
 	return {"version": SAVE_VERSION, "game": "evolution", "seed": seed_value, "time_min": time_min,
 		"next_id": next_id, "heights": Array(terrain.heights), "objects": objs, "residents": res,
 		"events": events.duplicate(true), "next_resident_id": next_resident_id, "stats": stats.duplicate(true),
-		"pop_history": pop_history.duplicate(true), "archive": archive.map(func(m): return m.to_dict())}
+		"pop_history": pop_history.duplicate(true), "archive": archive.map(func(m): return m.to_dict()),
+		"settlement": settlement.duplicate(true)}
 
 ## Загрузка. Пустая строка — успех, иначе текст ошибки (мир не меняется при ошибке).
 func load_dict(d: Dictionary) -> String:
@@ -589,6 +625,17 @@ func load_dict(d: Dictionary) -> String:
 			if r.mind.family_name == "":
 				r.mind.family_name = r.mind.name
 				r.mind.born_at = time_min - r.mind.age_years * Mind.YEAR_MIN
+	var sd = d.get("settlement", {})
+	if sd is Dictionary:
+		for k in sd:
+			settlement[k] = sd[k]
+	if not (settlement["discoveries"] is Array):
+		settlement["discoveries"] = []
+	# сохранения до версии 3: у деревьев и камней не было запаса материала
+	if int(d.get("version", 1)) < 3:
+		for o in objects.values():
+			if o.obj_type in ["tree", "rock"] and o.amount <= 0.0:
+				o.amount = float(Defs.max_amount(o.obj_type))
 	for e in d.get("events", []):
 		if e is Dictionary:
 			events.append(e)

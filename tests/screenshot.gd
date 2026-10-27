@@ -9,13 +9,18 @@ func _run():
 	await process_frame
 	main.world.time_min = float(args[2]) * 60.0 if args.size() > 2 else 9.5 * 60.0
 	var mode: String = args[1] if args.size() > 1 else ""
-	if mode in ["family", "demo", "kid"]:
+	if mode in ["family", "demo", "kid", "settle", "town"]:
 		main.world.new_world(2024)
 		for i in 44 * 1440: main.world.step(1.0)
 		main.world.time_min = floor(main.world.time_min / 1440.0) * 1440.0 + (float(args[2]) if args.size() > 2 else 10.0) * 60.0
 	for i in 40: main.world.step(1.0)
 	if mode == "family":
 		main.hud._toggle_side("family")
+	elif mode == "settle" or mode == "town":
+		var Settlement = load("res://scripts/core/settlement.gd")
+		main.camera.focus_on(Settlement.center(main.world), 26.0 if mode == "town" else 16.0)
+		if mode == "settle":
+			main.hud._toggle_side("settlement")
 	elif mode == "demo":
 		main.hud._toggle_side("world")
 	elif mode == "kid":
